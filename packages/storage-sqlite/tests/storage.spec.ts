@@ -178,6 +178,60 @@ const appendTextEvent = (
     ...(options.facts === undefined ? {} : { facts: options.facts }),
   }).event
 
+const createOriginalTriggerMigrationFixture = async () => {
+  const filename = path.join(await temporaryDirectory(), 'core.sqlite')
+  await createDatabaseAtMigration(filename, 62)
+  // This SQL is byte-for-byte the old main's 0063, now numbered 0065 after the upstream merge.
+  const source = await readFile(path.join(migrationsDirectory, '0065_admission_turn_trigger.sql'), 'utf8')
+  const hash = createHash('sha256').update(source).digest('hex')
+  const native = new BetterSqlite3(filename)
+  try {
+    native.transaction(() => {
+      native.exec(source)
+      native.prepare('INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)').run(hash, 1794197225222)
+    })()
+  } finally {
+    native.close()
+  }
+  const database = openCoreDatabase(filename)
+  try {
+    const repository = new SqliteCoreRepository(database)
+    let sequence = 0
+    const core = new CoreService(repository, { now: () => 100, nextUlid: () => `OLDTRIGGER${++sequence}` })
+    const agent = createAgent(core)
+    const connection = core.createConnection({ adapterKey: 'fixture-alpha', config: {} })
+    const channel = core.createChannel({
+      connectionId: connection.id,
+      platformChannelId: 'original-trigger-fixture',
+      kind: 'internal',
+    })
+    const event = appendTextEvent(core, connection.id, channel.id, 'original-trigger-event', '保留原轮次来源', 100)
+    const episodeId = EpisodeIdSchema.parse('eps_ORIGINALTRIGGER')
+    repository.createEpisode({
+      id: episodeId,
+      channelId: channel.id,
+      agentId: agent.definition.id,
+      agentRevisionId: agent.revision.id,
+      status: 'opening',
+      openedAtEventId: event.id,
+      createdAt: 101,
+    })
+    const admissionId = AdmissionIdSchema.parse('adm_ORIGINALTRIGGER')
+    repository.createAdmission({
+      id: admissionId,
+      episodeId,
+      mode: 'followup',
+      state: 'pending',
+      eventIds: [event.id],
+      triggerEventId: event.id,
+      createdAt: 102,
+    })
+    return { filename, hash, event, episodeId, admissionId }
+  } finally {
+    database.close()
+  }
+}
+
 describe('Core SQLite baseline', () => {
   it('writes feedback permission only when enabled and reads an omitted grant as disabled', async () => {
     const { database, core, repository } = await createFixture()
@@ -221,6 +275,103 @@ describe('Core SQLite baseline', () => {
       database.close()
     }
   })
+
+  it('upgrades the original trigger migration without replaying it or losing its stored trigger', async () => {
+    const fixture = await createOriginalTriggerMigrationFixture()
+    let receipts: unknown
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const migrated = await openMigratedCoreDatabase(fixture.filename)
+      try {
+        const repository = new SqliteCoreRepository(migrated)
+        expect(repository.getChannelEvent(fixture.event.id)).toEqual(fixture.event)
+        expect(repository.listRecoverableAdmissions(fixture.episodeId)).toEqual([
+          {
+            id: fixture.admissionId,
+            episodeId: fixture.episodeId,
+            mode: 'followup',
+            state: 'pending',
+            eventIds: [fixture.event.id],
+            triggerEventId: fixture.event.id,
+            createdAt: 102,
+          },
+        ])
+        expect(migrated.pragma('foreign_keys')).toBe(1)
+      } finally {
+        migrated.close()
+      }
+      const inspected = new BetterSqlite3(fixture.filename, { readonly: true })
+      try {
+        expect(
+          inspected
+            .prepare(
+              "SELECT name FROM sqlite_master WHERE name IN ('push_subscriptions', 'management_passkeys') ORDER BY name",
+            )
+            .all(),
+        ).toEqual([{ name: 'management_passkeys' }, { name: 'push_subscriptions' }])
+        const currentReceipts = inspected
+          .prepare('SELECT hash, created_at FROM __drizzle_migrations ORDER BY created_at')
+          .all()
+        expect(currentReceipts).toHaveLength(67)
+        expect(currentReceipts).toContainEqual({ hash: fixture.hash, created_at: 1794197225222 })
+        expect(currentReceipts).toContainEqual({ hash: fixture.hash, created_at: 1794365082279 })
+        if (attempt === 0) receipts = currentReceipts
+        else expect(currentReceipts).toEqual(receipts)
+        expect(inspected.pragma('foreign_key_check')).toEqual([])
+      } finally {
+        inspected.close()
+      }
+    }
+  })
+
+  it.each(['different hash', 'different timestamp'])(
+    'does not skip the renamed trigger for a receipt with %s, rolls back and can retry after correction',
+    async (difference) => {
+      const fixture = await createOriginalTriggerMigrationFixture()
+      const invalidHash = difference === 'different hash' ? 'synthetic-unknown-trigger' : fixture.hash
+      const invalidTimestamp = difference === 'different timestamp' ? 1794197225223 : 1794197225222
+      mutateSqlite(
+        fixture.filename,
+        'UPDATE __drizzle_migrations SET hash = ?, created_at = ? WHERE created_at = ?',
+        invalidHash,
+        invalidTimestamp,
+        1794197225222,
+      )
+      const before = new BetterSqlite3(fixture.filename, { readonly: true })
+      const schema = before.prepare('SELECT name, sql FROM sqlite_master ORDER BY name').all()
+      const receipts = before.prepare('SELECT hash, created_at FROM __drizzle_migrations ORDER BY created_at').all()
+      const admissions = before.prepare('SELECT * FROM admissions').all()
+      before.close()
+      await expect(openMigratedCoreDatabase(fixture.filename)).rejects.toThrow(
+        'duplicate column name: trigger_event_id',
+      )
+      const failed = new BetterSqlite3(fixture.filename, { readonly: true })
+      try {
+        expect(failed.prepare('SELECT name, sql FROM sqlite_master ORDER BY name').all()).toEqual(schema)
+        expect(failed.prepare('SELECT hash, created_at FROM __drizzle_migrations ORDER BY created_at').all()).toEqual(
+          receipts,
+        )
+        expect(failed.prepare('SELECT * FROM admissions').all()).toEqual(admissions)
+      } finally {
+        failed.close()
+      }
+      mutateSqlite(
+        fixture.filename,
+        'UPDATE __drizzle_migrations SET hash = ?, created_at = ? WHERE created_at = ?',
+        fixture.hash,
+        1794197225222,
+        invalidTimestamp,
+      )
+      const retried = await openMigratedCoreDatabase(fixture.filename)
+      try {
+        expect(new SqliteCoreRepository(retried).listRecoverableAdmissions(fixture.episodeId)[0]).toMatchObject({
+          id: fixture.admissionId,
+          triggerEventId: fixture.event.id,
+        })
+      } finally {
+        retried.close()
+      }
+    },
+  )
 
   it('upgrades migration 24 with referenced Admissions without dropping their event links', async () => {
     const filename = path.join(await temporaryDirectory(), 'core.sqlite')

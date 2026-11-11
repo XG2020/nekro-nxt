@@ -103,8 +103,18 @@ export class CoreDatabase {
             'CREATE TABLE IF NOT EXISTS __drizzle_migrations (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at numeric)',
           )
           const record = this.#native.prepare('INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)')
+          const originalTriggerReceipt = this.#native.prepare(
+            'SELECT 1 FROM __drizzle_migrations WHERE created_at = ? AND hash = ?',
+          )
           for (const migration of pending) {
-            for (const statement of migration.sql) this.#native.exec(statement)
+            // The fork's 0063 trigger migration became 0065 when upstream added push subscriptions and passkeys.
+            // Only its exact original receipt and unchanged SQL identify a completed migration after renumbering.
+            const triggerWasRenumbered =
+              migration.folderMillis === 1794365082279 &&
+              originalTriggerReceipt.get(1794197225222, migration.hash) !== undefined
+            if (!triggerWasRenumbered) {
+              for (const statement of migration.sql) this.#native.exec(statement)
+            }
             record.run(migration.hash, migration.folderMillis)
           }
           checkIntegrity()

@@ -148,14 +148,14 @@ describe('browser sign-in through the management edge', () => {
     ]) {
       const route = `/login?next=${encodeURIComponent(next)}`
       const anonymous = await send('https', edge.port, route)
-      expect(anonymous.text).toContain('const next = "/"')
+      expect(anonymous.text).toContain('"next":"/"')
       const authenticated = await send('https', edge.port, route, { headers: { cookie: signedIn } })
       expect(authenticated.status).toBe(302)
       expect(authenticated.headers['location']).toBe('/')
     }
     const valid = '/channels?view=recent#top'
     const page = await send('https', edge.port, `/login?next=${encodeURIComponent(valid)}`)
-    expect(page.text).toContain(`const next = ${JSON.stringify(valid)}`)
+    expect(page.text).toContain(`"next":${JSON.stringify(valid)}`)
   })
 
   it('closes idle connections before they select HTTP or TLS', async () => {
@@ -166,6 +166,8 @@ describe('browser sign-in through the management edge', () => {
     let deadline: ReturnType<typeof setTimeout> | undefined
     try {
       await once(socket, 'connect')
+      // The client can connect before the server accepts the socket on Windows.
+      await vi.waitFor(() => expect(vi.getTimerCount()).toBeGreaterThan(0))
       await vi.advanceTimersByTimeAsync(10_000)
       vi.useRealTimers()
       const timedOut = new Promise<boolean>((resolve) => {
