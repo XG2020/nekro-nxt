@@ -2,10 +2,13 @@ declare const styles: {
   readonly actions: string
   readonly adapterName: string
   readonly addonDetail: string
-  readonly barkFields: string
   readonly brand: string
   readonly brandAmbient: string
+  readonly channelFieldAction: string
+  readonly channelFields: string
   readonly claimCode: string
+  readonly codeEntry: string
+  readonly codeText: string
   readonly deviceName: string
   readonly faint: string
   readonly head: string
@@ -14,6 +17,7 @@ declare const styles: {
   readonly licenses: string
   readonly link: string
   readonly loading: string
+  readonly loginCode: string
   readonly movePlan: string
   readonly muted: string
   readonly narrowNav: string
@@ -22,13 +26,16 @@ declare const styles: {
   readonly note: string
   readonly noteWarn: string
   readonly notice: string
+  readonly originField: string
   readonly path: string
   readonly pickInfo: string
   readonly pickList: string
   readonly providerStatus: string
+  readonly qr: string
   readonly row: string
   readonly rowChevron: string
   readonly rowControls: string
+  readonly scanner: string
   readonly source: string
   readonly srOnly: string
   readonly title: string

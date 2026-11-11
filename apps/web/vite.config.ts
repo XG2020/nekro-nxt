@@ -1,6 +1,8 @@
 import react from '@vitejs/plugin-react'
-import { defineConfig } from 'vite'
+import { defineConfig, type Plugin } from 'vite'
+import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
 import { workspaceSourceAliases } from '../../scripts/workspace-source-aliases.mjs'
 
@@ -14,8 +16,43 @@ const productPackageSource = readFileSync(new URL('../../package.json', import.m
 const productVersion = /^\s*"version"\s*:\s*"([^"]+)"/mu.exec(productPackageSource)?.[1]
 if (!productVersion) throw new Error('根 package.json 缺少产品版本。')
 
+/**
+ * `NEKRO_DEV_PROXY_PAGES=built`: the dev server also keeps `dist/` built, because the sign-in layer gives requests
+ * from the reverse proxy the built pages. Old hashed files stay so a page opened before a rebuild still finds its
+ * chunks, and `index.html` is never missing while a rebuild runs.
+ */
+const keepDistBuilt = (): Plugin => ({
+  name: 'nekro-nxt:keep-dist-built',
+  apply: 'serve',
+  configureServer(server) {
+    if (process.env['NEKRO_DEV_PROXY_PAGES'] !== 'built') return
+    // A separate process: inside the dev server NODE_ENV is `development`, and a build there would ship React's
+    // development build.
+    const builder = spawn(
+      process.execPath,
+      [
+        fileURLToPath(new URL('./node_modules/vite/bin/vite.js', import.meta.url)),
+        'build',
+        '--watch',
+        '--emptyOutDir',
+        'false',
+        '--logLevel',
+        'warn',
+      ],
+      {
+        cwd: fileURLToPath(new URL('.', import.meta.url)),
+        env: { ...process.env, NODE_ENV: 'production' },
+        stdio: 'inherit',
+      },
+    )
+    const stop = () => builder.kill()
+    server.httpServer?.once('close', stop)
+    for (const signal of ['exit', 'SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.once(signal, stop)
+  },
+})
+
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), keepDistBuilt()],
   define: {
     __NEKRO_PRODUCT_VERSION__: JSON.stringify(productVersion),
     __NEKRO_PRODUCT_RELEASE_ID__: JSON.stringify(process.env['NEKRO_RELEASE_ID'] ?? ''),
@@ -31,13 +68,13 @@ export default defineConfig({
     proxy: {
       // 开发模式下把领域 API 转发到本机 NekroNxt Server（apps/server，默认 4960）。
       // 生产构建由 server 通过 dsh-host-frontend-static 同源托管，无需代理。
-      '/health': { target: apiProxyTarget, changeOrigin: true },
+      // 保留浏览器的 Host：登录层按它核对请求来源。路径清单与 management-edge.ts 的 serverOwnedPath 一致。
+      '/health': { target: apiProxyTarget },
       // 社区登录的回跳页由 Server 直接返回；不转发时会落到前端路由，登录永远完成不了。
-      '/community/callback': { target: apiProxyTarget, changeOrigin: true },
-      '/api': {
-        target: apiProxyTarget,
-        changeOrigin: true,
-      },
+      '/community/callback': { target: apiProxyTarget },
+      '/api': { target: apiProxyTarget },
+      // 开发实例设置了管理密钥时，登录页由登录层返回；不转发时 Vite 会返回首页，页面在登录和首页之间来回跳。
+      '/login': { target: apiProxyTarget },
     },
   },
 })

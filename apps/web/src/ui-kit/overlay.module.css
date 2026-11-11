@@ -16,15 +16,15 @@
 
 .dialog {
   position: fixed;
-  top: 13vh;
+  top: max(13vh, calc(var(--safe-top) + var(--s-4)));
   left: 50%;
   z-index: 51;
   display: grid;
   /* Title and actions stay in view; only the body scrolls when the content is taller than the window. */
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: var(--s-4);
-  width: min(440px, calc(100vw - 32px));
-  max-height: 80vh;
+  width: min(440px, calc(100vw - 32px - var(--safe-left) - var(--safe-right)));
+  max-height: calc(80vh - var(--safe-bottom));
   overflow: hidden;
   padding: var(--s-6);
   border: 1px solid var(--line);
@@ -33,6 +33,12 @@
   background: var(--surface);
   box-shadow: var(--sh-3);
   translate: -50% 0;
+}
+
+/* With the on-screen keyboard up, a dialog moves to the top of what is still visible and fits above the keyboard. */
+:global(html[data-keyboard]) .dialog {
+  top: calc(var(--viewport-top, 0px) + max(var(--s-3), var(--safe-top)));
+  max-height: calc(var(--viewport-height, 100dvh) - max(var(--s-3), var(--safe-top)) - var(--s-3));
 }
 
 .dialog[data-state='open'] {
@@ -44,13 +50,13 @@
 }
 
 .wide {
-  width: min(620px, calc(100vw - 32px));
+  width: min(620px, calc(100vw - 32px - var(--safe-left) - var(--safe-right)));
 }
 
 .media {
-  top: 5vh;
-  width: min(920px, calc(100vw - 48px));
-  max-height: 90vh;
+  top: max(5vh, var(--safe-top));
+  width: min(920px, calc(100vw - 48px - var(--safe-left) - var(--safe-right)));
+  max-height: calc(90vh - var(--safe-top) - var(--safe-bottom));
 }
 
 .titleRow {
@@ -104,13 +110,16 @@
 
 .sheet {
   position: fixed;
-  top: 0;
+  /* The keyboard insets are zero unless an iOS keyboard covers part of the page (keyboard-viewport.ts). */
+  top: var(--viewport-top, 0px);
   right: 0;
-  bottom: 0;
+  bottom: var(--keyboard-inset, 0px);
   z-index: 51;
   display: flex;
   flex-direction: column;
   width: min(460px, 100vw);
+  /* Phones: the head stays below the status bar and the last row above the home indicator. */
+  padding: var(--safe-top) var(--safe-right) var(--safe-bottom) 0;
   border-left: 1px solid var(--line);
   outline: none;
   background: var(--surface);
@@ -176,6 +185,17 @@
   box-shadow: var(--sh-3), var(--hl);
   backdrop-filter: var(--blur);
   transform-origin: var(--radix-dropdown-menu-content-transform-origin);
+}
+
+/* Phones: an opaque menu over a dimmed page, so neither the content behind nor its taps get mixed in. */
+@media (max-width: 760px) {
+  .menu {
+    background: var(--surface);
+    box-shadow:
+      var(--sh-3),
+      var(--hl),
+      0 0 0 100vmax var(--scrim);
+  }
 }
 
 .popover {
@@ -284,10 +304,10 @@
     background-color 120ms ease;
 }
 
-/* The mark stays small; the hit area reaches the 32px minimum target. */
+/* The mark stays small; the hit area reaches --target. */
 .infoTip::after {
   position: absolute;
-  inset: -7px;
+  inset: calc((18px - var(--target)) / 2);
   content: '';
 }
 
@@ -340,7 +360,7 @@
 
 .toasts {
   position: fixed;
-  bottom: 46px;
+  bottom: calc(var(--chrome-bottom) + 14px);
   left: 50%;
   z-index: 80;
   display: grid;

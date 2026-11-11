@@ -1,3 +1,4 @@
+import { AccessSettings } from './access-settings.js'
 import { LlmProviderRemovalResultUnknown } from './host-model-settings.js'
 import {
   DshNxtHostUiSchema,
@@ -130,7 +131,7 @@ export function registerSettingsRoutes({
   registerRoute({
     kind: 'exact',
     path: '/api/client-notifications',
-    handler: (req, res) => {
+    handler: async (req, res) => {
       if (req.method !== 'GET') {
         writeError(res, 405, 'method-not-allowed', 'Method not allowed.')
         return
@@ -138,15 +139,23 @@ export function registerSettingsRoutes({
       try {
         const url = new URL(req.url ?? '/', 'http://localhost')
         const rawCursor = url.searchParams.get('cursor')
+        const boot = url.searchParams.get('boot')
+        const rawWait = url.searchParams.get('wait')
         const params = HostApiContracts.listClientNotifications.parseParams({
           ...(rawCursor === null ? {} : { cursor: Number(rawCursor) }),
+          ...(boot === null ? {} : { boot }),
+          ...(rawWait === null ? {} : { wait: Number(rawWait) }),
         })
-        writeContractJson(
-          res,
-          200,
-          HostApiContracts.listClientNotifications,
-          runtime.notifications.readClientNotifications(params.cursor),
-        )
+        const closed = new AbortController()
+        res.once('close', () => closed.abort())
+        const feed = await runtime.notifications.waitClientNotifications({
+          ...(params.cursor === undefined ? {} : { cursor: params.cursor }),
+          ...(params.boot === undefined ? {} : { boot: params.boot }),
+          waitMs: (params.wait ?? 0) * 1_000,
+          signal: closed.signal,
+        })
+        if (closed.signal.aborted) return
+        writeContractJson(res, 200, HostApiContracts.listClientNotifications, feed)
       } catch (error) {
         writeError(res, 400, 'client-notifications-failed', error instanceof Error ? error.message : String(error))
       }
@@ -172,6 +181,29 @@ export function registerSettingsRoutes({
             ...(parsed.bark.deviceKey === undefined ? {} : { deviceKey: parsed.bark.deviceKey }),
             ...(parsed.bark.clearDeviceKey === undefined ? {} : { clearDeviceKey: parsed.bark.clearDeviceKey }),
           },
+          ...(parsed.browserPush === undefined ? {} : { browserPush: parsed.browserPush }),
+          ...(parsed.wecom === undefined
+            ? {}
+            : {
+                wecom: {
+                  enabled: parsed.wecom.enabled,
+                  ...(parsed.wecom.webhookUrl === undefined ? {} : { webhookUrl: parsed.wecom.webhookUrl }),
+                  ...(parsed.wecom.clearWebhookUrl === undefined
+                    ? {}
+                    : { clearWebhookUrl: parsed.wecom.clearWebhookUrl }),
+                },
+              }),
+          ...(parsed.ntfy === undefined
+            ? {}
+            : {
+                ntfy: {
+                  enabled: parsed.ntfy.enabled,
+                  serverUrl: parsed.ntfy.serverUrl,
+                  ...(parsed.ntfy.topic === undefined ? {} : { topic: parsed.ntfy.topic }),
+                  ...(parsed.ntfy.token === undefined ? {} : { token: parsed.ntfy.token }),
+                  ...(parsed.ntfy.clearToken === undefined ? {} : { clearToken: parsed.ntfy.clearToken }),
+                },
+              }),
           events: parsed.events,
         })
         writeContractJson(res, 200, HostApiContracts.updateNotificationSettings, settings)
@@ -196,6 +228,80 @@ export function registerSettingsRoutes({
           ...(parsed.deviceKey === undefined ? {} : { deviceKey: parsed.deviceKey }),
         })
         writeContractJson(res, 200, HostApiContracts.testBarkNotification, { sent: true })
+      } catch (error) {
+        writeError(res, 400, 'notification-test-failed', error instanceof Error ? error.message : String(error))
+      }
+    },
+  })
+
+  registerRoute({
+    kind: 'exact',
+    path: '/api/settings/access',
+    handler: async (req, res) => {
+      const access = new AccessSettings(runtime.repository)
+      try {
+        if (req.method === 'GET') {
+          const publicOrigin = access.publicOrigin()
+          writeContractJson(
+            res,
+            200,
+            HostApiContracts.getAccessSettings,
+            publicOrigin === undefined ? {} : { publicOrigin },
+          )
+          return
+        }
+        if (req.method === 'PUT') {
+          const parsed = HostApiContracts.updateAccessSettings.parseRequest(await readJsonBody(req))
+          const publicOrigin = access.setPublicOrigin(parsed.publicOrigin ?? undefined)
+          writeContractJson(
+            res,
+            200,
+            HostApiContracts.updateAccessSettings,
+            publicOrigin === undefined ? {} : { publicOrigin },
+          )
+          return
+        }
+        writeError(res, 405, 'method-not-allowed', 'Method not allowed.')
+      } catch (error) {
+        writeError(res, 400, 'access-settings-failed', error instanceof Error ? error.message : String(error))
+      }
+    },
+  })
+
+  registerRoute({
+    kind: 'exact',
+    path: '/api/settings/notifications/test-wecom',
+    handler: async (req, res) => {
+      if (req.method !== 'POST') {
+        writeError(res, 405, 'method-not-allowed', 'Method not allowed.')
+        return
+      }
+      try {
+        const parsed = HostApiContracts.testWecomNotification.parseRequest(await readJsonBody(req))
+        await runtime.notifications.testWecom(parsed.webhookUrl === undefined ? {} : { webhookUrl: parsed.webhookUrl })
+        writeContractJson(res, 200, HostApiContracts.testWecomNotification, { sent: true })
+      } catch (error) {
+        writeError(res, 400, 'notification-test-failed', error instanceof Error ? error.message : String(error))
+      }
+    },
+  })
+
+  registerRoute({
+    kind: 'exact',
+    path: '/api/settings/notifications/test-ntfy',
+    handler: async (req, res) => {
+      if (req.method !== 'POST') {
+        writeError(res, 405, 'method-not-allowed', 'Method not allowed.')
+        return
+      }
+      try {
+        const parsed = HostApiContracts.testNtfyNotification.parseRequest(await readJsonBody(req))
+        await runtime.notifications.testNtfy({
+          serverUrl: parsed.serverUrl,
+          ...(parsed.topic === undefined ? {} : { topic: parsed.topic }),
+          ...(parsed.token === undefined ? {} : { token: parsed.token }),
+        })
+        writeContractJson(res, 200, HostApiContracts.testNtfyNotification, { sent: true })
       } catch (error) {
         writeError(res, 400, 'notification-test-failed', error instanceof Error ? error.message : String(error))
       }

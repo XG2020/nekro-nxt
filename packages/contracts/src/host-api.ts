@@ -69,7 +69,15 @@ import {
   PromptDocumentV1Schema,
   promptDocumentPlainText,
 } from './domain.js'
-import { ClientNotificationSchema, ManagementDeviceIdSchema, ManagementDeviceViewSchema } from './management-api.js'
+import {
+  ClientNotificationSchema,
+  ManagementDeviceIdSchema,
+  ManagementDeviceViewSchema,
+  ManagementLoginCodeSchema,
+  ManagementLoginRequestViewSchema,
+  ManagementPasskeyViewSchema,
+  ManagementSignInViewSchema,
+} from './management-api.js'
 import { ConfigSchemaDocumentSchema } from './config-schema.js'
 import {
   CommunityExtensionDetailSchema,
@@ -421,6 +429,21 @@ export const NotificationSettingsViewSchema = z
         deviceKeyConfigured: z.boolean(),
       })
       .strict(),
+    /** Defaults read an older host's view, which has none of these channels. */
+    browserPush: z.object({ enabled: z.boolean() }).strict().default({ enabled: false }),
+    wecom: z
+      .object({ enabled: z.boolean(), webhookConfigured: z.boolean() })
+      .strict()
+      .default({ enabled: false, webhookConfigured: false }),
+    ntfy: z
+      .object({
+        enabled: z.boolean(),
+        serverUrl: z.url(),
+        topicConfigured: z.boolean(),
+        tokenConfigured: z.boolean(),
+      })
+      .strict()
+      .default({ enabled: false, serverUrl: 'https://ntfy.sh', topicConfigured: false, tokenConfigured: false }),
     events: z
       .object({
         'dynamic-client-approval-requested': z.boolean(),
@@ -444,6 +467,26 @@ export const UpdateNotificationSettingsRequestSchema = z
         clearDeviceKey: z.boolean().optional(),
       })
       .strict(),
+    /** Channels an older client leaves out keep their stored values. */
+    browserPush: z.object({ enabled: z.boolean() }).strict().optional(),
+    wecom: z
+      .object({
+        enabled: z.boolean(),
+        webhookUrl: z.url().max(2048).optional(),
+        clearWebhookUrl: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
+    ntfy: z
+      .object({
+        enabled: z.boolean(),
+        serverUrl: z.url(),
+        topic: z.string().trim().min(1).max(64).optional(),
+        token: z.string().trim().min(1).max(512).optional(),
+        clearToken: z.boolean().optional(),
+      })
+      .strict()
+      .optional(),
     events: z
       .object({
         'dynamic-client-approval-requested': z.boolean(),
@@ -463,12 +506,52 @@ export const TestBarkNotificationRequestSchema = z
   .object({ serverUrl: z.url(), deviceKey: z.string().trim().min(1).max(2048).optional() })
   .strict()
 
+export const TestWecomNotificationRequestSchema = z.object({ webhookUrl: z.url().max(2048).optional() }).strict()
+
+export const TestNtfyNotificationRequestSchema = z
+  .object({
+    serverUrl: z.url(),
+    topic: z.string().trim().min(1).max(64).optional(),
+    token: z.string().trim().min(1).max(512).optional(),
+  })
+  .strict()
+
+export const AccessSettingsViewSchema = z.object({ publicOrigin: z.url().optional() }).strict()
+
+/** A browser subscribed to push; the settings page names it by `id`, never by its endpoint. */
+export const PushSubscriptionViewSchema = z
+  .object({
+    id: z.string().regex(/^[a-f0-9]{32}$/u),
+    deviceId: ManagementDeviceIdSchema,
+    deviceLabel: z.string().min(1).max(80),
+    label: z.string().min(1).max(80),
+    createdAt: z.number().int().nonnegative(),
+    lastDeliveredAt: z.number().int().nonnegative().optional(),
+  })
+  .strict()
+
+export const RegisterPushSubscriptionRequestSchema = z
+  .object({
+    endpoint: z.url().max(2048),
+    keys: z.object({ p256dh: z.string().min(1).max(256), auth: z.string().min(1).max(64) }).strict(),
+    label: z.string().trim().min(1).max(80),
+  })
+  .strict()
+
+/**
+ * `bootId` names this run of the instance and is returned only to clients that sent `boot`, so older clients keep the
+ * shape they parse strictly. A cursor from another run is replaced by the current baseline.
+ */
 export const ClientNotificationFeedResponseSchema = z
   .object({
     cursor: z.number().int().nonnegative(),
     notifications: z.array(ClientNotificationSchema),
+    bootId: z.string().min(1).max(64).optional(),
   })
   .strict()
+
+/** Longest a client may hold the notification request open waiting for news. */
+export const CLIENT_NOTIFICATION_MAX_WAIT_SECONDS = 30
 
 /** Which model writes one kind of compaction summary: that kind's default, or a model chosen for this agent. */
 export const AgentCompactionModelChoiceSchema = z.discriminatedUnion('mode', [
@@ -3536,9 +3619,96 @@ export const HostApiContracts = {
   listClientNotifications: defineContract({
     method: 'GET',
     path: '/api/client-notifications',
-    params: z.object({ cursor: z.number().int().nonnegative().optional() }).strict(),
+    params: z
+      .object({
+        cursor: z.number().int().nonnegative().optional(),
+        /** The run the client's cursor came from; empty on the first request. */
+        boot: z.string().max(64).optional(),
+        /** Seconds to wait when nothing is new yet. */
+        wait: z.number().int().min(0).max(CLIENT_NOTIFICATION_MAX_WAIT_SECONDS).optional(),
+      })
+      .strict(),
     request: NoRequestBodySchema,
     response: ClientNotificationFeedResponseSchema,
+    error: HostApiErrorSchema,
+  }),
+  testWecomNotification: defineContract({
+    method: 'POST',
+    path: '/api/settings/notifications/test-wecom',
+    params: EmptyParamsSchema,
+    request: TestWecomNotificationRequestSchema,
+    response: z.object({ sent: z.literal(true) }).strict(),
+    error: HostApiErrorSchema,
+  }),
+  testNtfyNotification: defineContract({
+    method: 'POST',
+    path: '/api/settings/notifications/test-ntfy',
+    params: EmptyParamsSchema,
+    request: TestNtfyNotificationRequestSchema,
+    response: z.object({ sent: z.literal(true) }).strict(),
+    error: HostApiErrorSchema,
+  }),
+  /** The address people open this instance at from elsewhere; absent until someone sets it. */
+  getAccessSettings: defineContract({
+    method: 'GET',
+    path: '/api/settings/access',
+    params: EmptyParamsSchema,
+    request: NoRequestBodySchema,
+    response: AccessSettingsViewSchema,
+    error: HostApiErrorSchema,
+  }),
+  updateAccessSettings: defineContract({
+    method: 'PUT',
+    path: '/api/settings/access',
+    params: EmptyParamsSchema,
+    request: z.object({ publicOrigin: z.string().trim().max(2048).nullable() }).strict(),
+    response: AccessSettingsViewSchema,
+    error: HostApiErrorSchema,
+  }),
+  getWebPushKey: defineContract({
+    method: 'GET',
+    path: '/api/push/key',
+    params: EmptyParamsSchema,
+    request: NoRequestBodySchema,
+    response: z.object({ publicKey: z.string().min(1) }).strict(),
+    error: HostApiErrorSchema,
+  }),
+  /** `currentDeviceId` is the login device asking; the local console has none and cannot subscribe. */
+  listPushSubscriptions: defineContract({
+    method: 'GET',
+    path: '/api/push/subscriptions',
+    params: EmptyParamsSchema,
+    request: NoRequestBodySchema,
+    response: z
+      .object({
+        subscriptions: z.array(PushSubscriptionViewSchema),
+        currentDeviceId: ManagementDeviceIdSchema.optional(),
+      })
+      .strict(),
+    error: HostApiErrorSchema,
+  }),
+  registerPushSubscription: defineContract({
+    method: 'POST',
+    path: '/api/push/subscriptions',
+    params: EmptyParamsSchema,
+    request: RegisterPushSubscriptionRequestSchema,
+    response: PushSubscriptionViewSchema,
+    error: HostApiErrorSchema,
+  }),
+  deletePushSubscription: defineContract({
+    method: 'DELETE',
+    path: '/api/push/subscriptions/:subscriptionId',
+    params: z.object({ subscriptionId: z.string().regex(/^[a-f0-9]{32}$/u) }).strict(),
+    request: NoRequestBodySchema,
+    response: z.object({ deleted: z.literal(true) }).strict(),
+    error: HostApiErrorSchema,
+  }),
+  testPushSubscription: defineContract({
+    method: 'POST',
+    path: '/api/push/subscriptions/:subscriptionId/test',
+    params: z.object({ subscriptionId: z.string().regex(/^[a-f0-9]{32}$/u) }).strict(),
+    request: NoRequestBodySchema,
+    response: z.object({ sent: z.literal(true) }).strict(),
     error: HostApiErrorSchema,
   }),
   updateNotificationSettings: defineContract({
@@ -4599,6 +4769,80 @@ export const HostApiContracts = {
     params: z.object({ deviceId: ManagementDeviceIdSchema }).strict(),
     request: NoRequestBodySchema,
     response: z.object({ revoked: z.boolean() }).strict(),
+    error: HostApiErrorSchema,
+  }),
+  getManagementSignIn: defineContract({
+    method: 'GET',
+    path: '/api/management/sign-in',
+    params: EmptyParamsSchema,
+    request: NoRequestBodySchema,
+    response: ManagementSignInViewSchema,
+    error: HostApiErrorSchema,
+  }),
+  /** Turning key sign-in off keeps the management key for recovery. */
+  updateManagementSignIn: defineContract({
+    method: 'PUT',
+    path: '/api/management/sign-in',
+    params: EmptyParamsSchema,
+    request: z.object({ keySignIn: z.boolean() }).strict(),
+    response: ManagementSignInViewSchema,
+    error: HostApiErrorSchema,
+  }),
+  /** WebAuthn creation options (JSON form) for a new passkey at the current host name. */
+  startPasskeyRegistration: defineContract({
+    method: 'POST',
+    path: '/api/management/passkeys/options',
+    params: EmptyParamsSchema,
+    request: NoRequestBodySchema,
+    response: z.looseObject({
+      challenge: z.string(),
+      rp: z.looseObject({ name: z.string(), id: z.string().optional() }),
+      user: z.looseObject({ id: z.string(), name: z.string(), displayName: z.string() }),
+      pubKeyCredParams: z.array(z.looseObject({ alg: z.number(), type: z.literal('public-key') })),
+    }),
+    error: HostApiErrorSchema,
+  }),
+  finishPasskeyRegistration: defineContract({
+    method: 'POST',
+    path: '/api/management/passkeys',
+    params: EmptyParamsSchema,
+    request: z
+      .object({ response: z.record(z.string(), z.unknown()), label: z.string().trim().min(1).max(80) })
+      .strict(),
+    response: ManagementPasskeyViewSchema,
+    error: HostApiErrorSchema,
+  }),
+  deletePasskey: defineContract({
+    method: 'DELETE',
+    path: '/api/management/passkeys/:passkeyId',
+    params: z.object({ passkeyId: z.string().min(1).max(512) }).strict(),
+    request: NoRequestBodySchema,
+    response: z.object({ deleted: z.literal(true) }).strict(),
+    error: HostApiErrorSchema,
+  }),
+  /** A code a new device scans to ask for sign-in; this device confirms afterwards. */
+  createLoginInvite: defineContract({
+    method: 'POST',
+    path: '/api/management/login-invites',
+    params: EmptyParamsSchema,
+    request: NoRequestBodySchema,
+    response: ManagementLoginCodeSchema,
+    error: HostApiErrorSchema,
+  }),
+  getLoginRequest: defineContract({
+    method: 'GET',
+    path: '/api/management/login-requests/:code',
+    params: z.object({ code: z.string().min(1).max(16) }).strict(),
+    request: NoRequestBodySchema,
+    response: ManagementLoginRequestViewSchema,
+    error: HostApiErrorSchema,
+  }),
+  decideLoginRequest: defineContract({
+    method: 'POST',
+    path: '/api/management/login-requests/:code/decision',
+    params: z.object({ code: z.string().min(1).max(16) }).strict(),
+    request: z.object({ approve: z.boolean() }).strict(),
+    response: ManagementLoginRequestViewSchema,
     error: HostApiErrorSchema,
   }),
   managementLogout: defineContract({

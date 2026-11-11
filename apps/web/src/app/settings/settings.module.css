@@ -140,15 +140,68 @@
   gap: var(--s-2);
 }
 
-.barkFields {
+.channelFields {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   align-items: start;
   gap: var(--s-3);
 }
 
-.barkFields > div:last-child:nth-child(3) {
+.channelFieldAction {
   grid-column: 1 / -1;
+}
+
+/* —— 登录与访问 —— */
+.originField {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2);
+}
+
+.originField > :first-child {
+  flex: 1 1 260px;
+}
+
+.codeEntry {
+  display: grid;
+  gap: var(--s-2);
+}
+
+.loginCode {
+  display: grid;
+  justify-items: center;
+  gap: var(--s-2);
+  text-align: center;
+}
+
+.qr {
+  width: 220px;
+  height: 220px;
+  padding: var(--s-2);
+  border-radius: var(--r-2);
+}
+
+.qr svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.codeText {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.scanner {
+  display: block;
+  width: 100%;
+  max-height: 60vh;
+  border-radius: var(--r-2);
+  background: var(--surface);
+  object-fit: cover;
 }
 
 /* —— 关于 —— */

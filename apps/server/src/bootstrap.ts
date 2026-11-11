@@ -151,7 +151,8 @@ import {
 import type { NxtPlatformResult } from '@nekro-nxt/extension-sdk'
 import { createNxtHostService, type NxtServiceBackends } from './extension-host-service.js'
 import { ChannelExtensionRuntimeHost, createChannelAsset, DshHostRuntime, type DshHostRuntimeOptions } from './index.js'
-import { NotificationService } from './notifications.js'
+import { NotificationService, type WebPushSender } from './notifications.js'
+import { AccessSettings } from './access-settings.js'
 import { CommunityService } from './community.js'
 import { ExtensionActionService } from './extension-governance/actions.js'
 import { commandPrefix, ExtensionCommandPort, waitingRunCommands } from './extension-governance/commands.js'
@@ -223,7 +224,7 @@ export interface NekroRuntimeOptions {
   readonly idleRolloverMs?: number | false
   readonly now?: () => number
   readonly nextUlid?: () => string
-  readonly notifications?: { readonly fetch?: typeof fetch }
+  readonly notifications?: { readonly fetch?: typeof fetch; readonly webPush?: WebPushSender }
   /** NekroNXT 社区地址（默认正式社区）与测试用 fetch。 */
   readonly community?: { readonly url?: string | undefined; readonly fetch?: typeof fetch }
   /** Replaced by an offline Fake for tests and AI validation; production uses fetch/ws. */
@@ -1639,7 +1640,11 @@ export class NekroRuntime {
       extensionServicePort.current = extensionService
       const notifications = new NotificationService(repository, credentials, {
         ...(options.notifications?.fetch === undefined ? {} : { fetch: options.notifications.fetch }),
+        ...(options.notifications?.webPush === undefined ? {} : { webPush: options.notifications.webPush }),
         now,
+        pushSubscriptions: hostSecurity,
+        redact: (text) => secrets.redact(text),
+        publicOrigin: () => new AccessSettings(repository).publicOrigin(),
       })
       notificationsPort.current = notifications
       await providerAccess.prepare(async () => {

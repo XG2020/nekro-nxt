@@ -5,6 +5,7 @@ import {
   ManagementDeviceIdSchema,
   ManagementSessionRequestSchema,
   ManagementSessionResponseSchema,
+  ManagementSignInViewSchema,
   ServerInstanceIdSchema,
   managementPairProofMessage,
   parseJsonValue,
@@ -17,8 +18,24 @@ import { X509Certificate, createHash, createHmac, randomBytes, timingSafeEqual }
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { request as httpRequest } from 'node:http'
 import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
+import { createRequire } from 'node:module'
+import { BlockList, connect } from 'node:net'
+import type { Duplex } from 'node:stream'
+import { gzipSync } from 'node:zlib'
 import { z } from 'zod'
 import { managementLoginPage } from './management-login-page.js'
+import { LoginRequests } from './login-requests.js'
+import { arrivedThroughProxy } from './proxy-guard.js'
+import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+  type AuthenticationResponseJSON,
+  type RegistrationResponseJSON,
+} from '@simplewebauthn/server'
+import QRCode from 'qrcode'
+import { isIP } from 'node:net'
 import { startHttpListener } from './http-listener.js'
 import path from 'node:path'
 import { generate } from 'selfsigned'
@@ -38,6 +55,7 @@ const MAX_JSON_BYTES = 64 * 1_024
 const MAX_PENDING_CHALLENGES = 256
 const CHALLENGES_PER_ADDRESS_PER_MINUTE = 10
 const CHALLENGE_RATE_WINDOW_MS = 60_000
+const LOGIN_CODES_PER_ADDRESS_PER_MINUTE = 20
 const nextUlid = monotonicFactory()
 
 interface ChallengeRecord {
@@ -52,8 +70,89 @@ interface SessionRecord {
 }
 
 export const managementLoginRequestSchema = z
-  .object({ managementKey: z.string().min(1).max(4096), acknowledgeInsecure: z.boolean().default(false) })
+  .object({
+    managementKey: z.string().min(1).max(4096),
+    acknowledgeInsecure: z.boolean().default(false),
+    /** The recovery entry, used when browser sign-in with the key is off. */
+    recovery: z.boolean().default(false),
+  })
   .strict()
+
+const passkeyLoginSchema = z
+  .object({ challengeId: z.string().min(1).max(128), response: z.record(z.string(), z.unknown()) })
+  .strict()
+const loginCodeSchema = z
+  .object({ code: z.string().min(1).max(16), acknowledgeInsecure: z.boolean().default(false) })
+  .strict()
+const loginPollSchema = z.object({ secret: z.string().min(1).max(128) }).strict()
+const PASSKEY_CHALLENGE_TTL_MS = 5 * 60 * 1_000
+
+const base64Url = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]*$/u)
+  .max(65_536)
+const credentialBase = {
+  id: base64Url,
+  rawId: base64Url,
+  type: z.literal('public-key'),
+  authenticatorAttachment: z.enum(['platform', 'cross-platform']).optional(),
+}
+/** What a browser sends back from `navigator.credentials.get`, in the JSON form the verifier reads. */
+const AuthenticationResponseSchema = z.object({
+  ...credentialBase,
+  response: z.object({
+    clientDataJSON: base64Url,
+    authenticatorData: base64Url,
+    signature: base64Url,
+    userHandle: base64Url.optional(),
+  }),
+})
+/** What a browser sends back from `navigator.credentials.create`. */
+const RegistrationResponseSchema = z.object({
+  ...credentialBase,
+  response: z.object({
+    clientDataJSON: base64Url,
+    attestationObject: base64Url,
+    transports: z.array(z.string()).optional(),
+  }),
+})
+
+const authenticationResponse = (input: unknown): AuthenticationResponseJSON => {
+  const parsed = AuthenticationResponseSchema.parse(input)
+  return {
+    id: parsed.id,
+    rawId: parsed.rawId,
+    type: parsed.type,
+    clientExtensionResults: {},
+    ...(parsed.authenticatorAttachment === undefined
+      ? {}
+      : { authenticatorAttachment: parsed.authenticatorAttachment }),
+    response: {
+      clientDataJSON: parsed.response.clientDataJSON,
+      authenticatorData: parsed.response.authenticatorData,
+      signature: parsed.response.signature,
+      ...(parsed.response.userHandle === undefined ? {} : { userHandle: parsed.response.userHandle }),
+    },
+  }
+}
+
+const registrationResponse = (input: unknown): RegistrationResponseJSON => {
+  const parsed = RegistrationResponseSchema.parse(input)
+  return {
+    id: parsed.id,
+    rawId: parsed.rawId,
+    type: parsed.type,
+    clientExtensionResults: {},
+    ...(parsed.authenticatorAttachment === undefined
+      ? {}
+      : { authenticatorAttachment: parsed.authenticatorAttachment }),
+    response: {
+      clientDataJSON: parsed.response.clientDataJSON,
+      attestationObject: parsed.response.attestationObject,
+      ...(parsed.response.transports === undefined ? {} : { transports: parsed.response.transports }),
+    },
+  }
+}
 
 export interface ManagementEdgeOptions {
   readonly host: '127.0.0.1' | '0.0.0.0'
@@ -64,8 +163,25 @@ export interface ManagementEdgeOptions {
   readonly releaseId: string
   readonly productVersion: string
   readonly repository: SqliteHostSecurityRepository
-  /** Trust `X-Forwarded-Proto` / `X-Forwarded-Host` from a reverse proxy that terminates HTTPS in front of plain HTTP. */
-  readonly trustProxy?: boolean
+  /**
+   * Trust `X-Forwarded-*` from a reverse proxy that terminates HTTPS in front of plain HTTP: `true` from every
+   * connection, a list of addresses or CIDR ranges only from those. Anyone who can reach the port directly can write
+   * these headers, so the list is the safe form whenever more than the proxy can connect.
+   */
+  readonly trustProxy?: boolean | readonly string[]
+  /**
+   * The Vite dev server of a source checkout, e.g. `http://127.0.0.1:4961`. Pages, modules and hot updates go there
+   * after sign-in; the Server's own paths still go to the product server.
+   */
+  readonly developmentWebOrigin?: string
+  /** The instance's access address; codes for other devices to scan point there when it is set. */
+  readonly publicOrigin?: () => string | undefined
+  /**
+   * With `developmentWebOrigin`: requests that came through the trusted reverse proxy get the built pages from the
+   * product server instead of the dev server. A phone far away then loads a few compressed bundles, not hundreds of
+   * unbundled modules; hot updates stay on the direct address.
+   */
+  readonly developmentBuiltPagesForProxy?: boolean
   readonly now?: () => number
 }
 
@@ -167,6 +283,27 @@ const publicProxyPath = (pathname: string): boolean =>
   pathname === '/pwa-maskable-512.png' ||
   pathname === '/community/callback'
 
+/** Paths the product server answers in development; Vite answers the rest. vite.config.ts proxies these and `/login`. */
+const serverOwnedPath = (pathname: string): boolean =>
+  pathname.startsWith('/api/') || pathname.startsWith('/health/') || pathname === '/community/callback'
+
+/** Only a dev server on this machine; anything else would send signed-in traffic elsewhere. */
+export const parseDevelopmentWebOrigin = (input: string | undefined): string | undefined => {
+  if (input === undefined || input.trim() === '') return undefined
+  const url = new URL(input.trim())
+  if (
+    url.protocol !== 'http:' ||
+    (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost') ||
+    url.port === '' ||
+    url.pathname !== '/' ||
+    url.search ||
+    url.username
+  ) {
+    throw new TypeError(`NEKRO_DEV_WEB_ORIGIN 只能是本机的 http 地址，例如 http://127.0.0.1:4961：${input}`)
+  }
+  return `http://127.0.0.1:${url.port}`
+}
+
 /** A short device name from the browser's User-Agent, e.g. 「浏览器 · Chrome · macOS」. */
 export const browserDeviceLabel = (userAgent: string | undefined): string => {
   const agent = userAgent ?? ''
@@ -192,6 +329,37 @@ export const browserDeviceLabel = (userAgent: string | undefined): string => {
             : undefined
   return ['浏览器', browser, system].filter((part) => part !== undefined).join(' · ')
 }
+
+/** Whether a connection from this address may speak for its clients through `X-Forwarded-*`. */
+export const proxyTrust = (
+  trustProxy: boolean | readonly string[] | undefined,
+): ((address: string | undefined) => boolean) => {
+  if (trustProxy === undefined || typeof trustProxy === 'boolean') return () => trustProxy === true
+  const trusted = new BlockList()
+  for (const entry of trustProxy) {
+    const [address = '', prefix] = entry.split('/')
+    const family = isIP(address) === 6 ? 'ipv6' : 'ipv4'
+    if (prefix === undefined) trusted.addAddress(address, family)
+    else trusted.addSubnet(address, Number(prefix), family)
+  }
+  return (address) => {
+    if (address === undefined) return false
+    // Node reports IPv4 peers of a dual-stack socket with a `::ffff:` prefix.
+    const plain = address.startsWith('::ffff:') && isIP(address.slice(7)) === 4 ? address.slice(7) : address
+    return isIP(plain) !== 0 && trusted.check(plain, isIP(plain) === 6 ? 'ipv6' : 'ipv4')
+  }
+}
+
+/** Where the login page loads the QR decoder from when it scans with the camera. */
+export const LOGIN_QR_DECODER_PATH = '/login/qr-decode.js'
+
+/** jsqr's browser build (it defines `window.jsQR`), read once and kept with its gzip form. */
+let qrDecoderScript: Promise<{ readonly plain: Buffer; readonly gzip: Buffer }> | undefined
+const loadQrDecoderScript = () =>
+  (qrDecoderScript ??= readFile(createRequire(import.meta.url).resolve('jsqr')).then((plain) => ({
+    plain,
+    gzip: gzipSync(plain),
+  })))
 
 /** Relative path inside this site to return to after login; anything else falls back to the root. */
 const safeNext = (value: string | null): string => {
@@ -308,6 +476,7 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
   const challenges = new Map<string, ChallengeRecord>()
   const sessions = new Map<string, SessionRecord>()
   const challengeRequests = new Map<string, number[]>()
+  const loginCodeRequests = new Map<string, number[]>()
   const lastActivityWrite = new Map<ManagementDeviceId, number>()
   const upstreamRequests = new Set<ClientRequest>()
   let stopping = false
@@ -322,14 +491,28 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
     return true
   }
 
+  /**
+   * Showing a sign-in code is not a guess at anything, and the login page asks for one every time it opens, so it
+   * has its own budget and reloading the page cannot lock key or passkey sign-in out.
+   */
+  const allowLoginCode = (address: string): boolean => {
+    cleanExpired()
+    const recent = loginCodeRequests.get(address) ?? []
+    if (recent.length >= LOGIN_CODES_PER_ADDRESS_PER_MINUTE) return false
+    loginCodeRequests.set(address, [...recent, now()])
+    return true
+  }
+
   const cleanExpired = (): void => {
     const timestamp = now()
     for (const [id, challenge] of challenges) if (challenge.expiresAt <= timestamp) challenges.delete(id)
     for (const [id, session] of sessions) if (session.expiresAt <= timestamp) sessions.delete(id)
-    for (const [address, requests] of challengeRequests) {
-      const retained = requests.filter((requestedAt) => requestedAt > timestamp - CHALLENGE_RATE_WINDOW_MS)
-      if (retained.length === 0) challengeRequests.delete(address)
-      else challengeRequests.set(address, retained)
+    for (const budget of [challengeRequests, loginCodeRequests]) {
+      for (const [address, requests] of budget) {
+        const retained = requests.filter((requestedAt) => requestedAt > timestamp - CHALLENGE_RATE_WINDOW_MS)
+        if (retained.length === 0) budget.delete(address)
+        else budget.set(address, retained)
+      }
     }
   }
 
@@ -339,13 +522,29 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
     return first?.split(',')[0]?.trim() || undefined
   }
 
+  const trustedProxyAddress = proxyTrust(options.trustProxy)
+  const viaTrustedProxy = (request: IncomingMessage): boolean => trustedProxyAddress(request.socket.remoteAddress)
+
   /** HTTPS on this socket, or a trusted reverse proxy that terminated HTTPS in front of it. */
   const secureRequest = (request: IncomingMessage): boolean =>
     ('encrypted' in request.socket && request.socket.encrypted === true) ||
-    (options.trustProxy === true && header(request, 'x-forwarded-proto') === 'https')
+    (viaTrustedProxy(request) && header(request, 'x-forwarded-proto') === 'https')
+
+  /**
+   * Who is asking, for rate limits. Behind a trusted proxy every connection comes from the proxy, so the address the
+   * proxy appended last to `X-Forwarded-For` names the client; earlier entries are whatever the client sent.
+   */
+  const clientAddress = (request: IncomingMessage): string => {
+    if (viaTrustedProxy(request)) {
+      const forwarded = request.headers['x-forwarded-for']
+      const last = (Array.isArray(forwarded) ? forwarded.join(',') : forwarded)?.split(',').at(-1)?.trim()
+      if (last) return last
+    }
+    return request.socket.remoteAddress ?? 'unknown'
+  }
 
   const publicHost = (request: IncomingMessage): string | undefined =>
-    (options.trustProxy === true ? header(request, 'x-forwarded-host') : undefined) ?? request.headers.host
+    (viaTrustedProxy(request) ? header(request, 'x-forwarded-host') : undefined) ?? request.headers.host
 
   const touchActivity = (deviceId: ManagementDeviceId): void => {
     const timestamp = now()
@@ -405,7 +604,17 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
     const deviceId = response === undefined ? undefined : deviceFromCookie(request)
     if (deviceId === undefined || response === undefined) return undefined
     const opened = openSession(request, deviceId)
-    response.setHeader('set-cookie', [...opened.cookies])
+    // A device in use keeps its cookie: the 30 days start again from this session.
+    const renewedDevice = cookie(
+      DEVICE_COOKIE,
+      parseCookies(request).get(DEVICE_COOKIE)!,
+      BROWSER_DEVICE_TTL_MS / 1_000,
+      {
+        httpOnly: true,
+        secure: secureRequest(request),
+      },
+    )
+    response.setHeader('set-cookie', [renewedDevice, ...opened.cookies])
     return opened
   }
 
@@ -413,7 +622,9 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
     if (methodIsSafe(request.method)) return true
     const host = publicHost(request)
     const origin = request.headers.origin
-    if (host === undefined || origin !== `${secureRequest(request) ? 'https' : 'http'}://${host}`) return false
+    // The address the browser shows: the request's own, or the access address when the proxy rewrites `Host`.
+    const sameOrigin = host !== undefined && origin === `${secureRequest(request) ? 'https' : 'http'}://${host}`
+    if (!sameOrigin && (origin === undefined || origin !== options.publicOrigin?.())) return false
     const cookieToken = parseCookies(request).get(CSRF_COOKIE)
     const headerToken = request.headers['x-nxt-csrf']
     return (
@@ -421,20 +632,385 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
     )
   }
 
+  const loginRequests = new LoginRequests(now)
+  /** Registration challenges per session token; sign-in challenges per one-time id. */
+  const registrationChallenges = new Map<string, { readonly challenge: string; readonly expiresAt: number }>()
+  const signInChallenges = new Map<string, { readonly challenge: string; readonly expiresAt: number }>()
+
+  /** The address the browser is using, as WebAuthn sees it. */
+  const requestOrigin = (request: IncomingMessage): string =>
+    `${secureRequest(request) ? 'https' : 'http'}://${publicHost(request) ?? '127.0.0.1'}`
+  const rpIdOf = (request: IncomingMessage): string => new URL(requestOrigin(request)).hostname
+  /** Browsers allow passkeys on HTTPS with a domain name, or on `localhost`. */
+  const passkeysAvailable = (request: IncomingMessage): boolean => {
+    const rpId = rpIdOf(request)
+    return rpId === 'localhost' || (secureRequest(request) && isIP(rpId) === 0)
+  }
+  /** Codes shown for another device point at the access address when there is one. */
+  const shareOrigin = (request: IncomingMessage): string => options.publicOrigin?.() ?? requestOrigin(request)
+  const qrSvg = (url: string): Promise<string> =>
+    QRCode.toString(url, { type: 'svg', margin: 1, errorCorrectionLevel: 'M' })
+
+  const cleanChallenges = (): void => {
+    const timestamp = now()
+    for (const store of [registrationChallenges, signInChallenges]) {
+      for (const [key, entry] of store) if (entry.expiresAt <= timestamp) store.delete(key)
+    }
+  }
+
+  /** A new browser device with its session: the same result whichever way the browser signed in. */
+  const signInBrowser = (request: IncomingMessage, response: ServerResponse, body: Record<string, unknown> = {}) => {
+    const deviceId = ManagementDeviceIdSchema.parse(`nxt_device_${nextUlid()}`)
+    const deviceSecret = randomBytes(32).toString('base64url')
+    options.repository.putDevice({
+      id: deviceId,
+      label: browserDeviceLabel(request.headers['user-agent']),
+      secretDigest: digest('nxt-device-secret-v1', deviceSecret),
+      createdAt: now(),
+    })
+    const opened = openSession(request, deviceId)
+    writeJson(
+      response,
+      200,
+      { authenticated: true, deviceId, ...body },
+      {
+        'set-cookie': [
+          cookie(DEVICE_COOKIE, `${deviceId}.${deviceSecret}`, BROWSER_DEVICE_TTL_MS / 1_000, {
+            httpOnly: true,
+            secure: secureRequest(request),
+          }),
+          ...opened.cookies,
+        ],
+      },
+    )
+  }
+
+  const signInView = (request: IncomingMessage) =>
+    ManagementSignInViewSchema.parse({
+      keySignIn: options.repository.keySignIn(),
+      rpId: rpIdOf(request),
+      passkeysAvailable: passkeysAvailable(request),
+      passkeys: options.repository.listPasskeys().map((passkey) => ({
+        id: passkey.id,
+        label: passkey.label,
+        rpId: passkey.rpId,
+        createdAt: passkey.createdAt,
+        ...(passkey.lastUsedAt === undefined ? {} : { lastUsedAt: passkey.lastUsedAt }),
+      })),
+    })
+
+  /** Public sign-in routes besides the management key: passkeys and one-time codes. */
+  const handlePublicSignIn = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+    pathname: string,
+  ): Promise<boolean> => {
+    if (request.method !== 'POST') return false
+    if (pathname === '/api/management/passkey-login/options') {
+      cleanChallenges()
+      if (!passkeysAvailable(request)) {
+        writeProblem(response, 400, 'passkeys_unavailable', '通行密钥需要通过 HTTPS 的域名访问。')
+        return true
+      }
+      const optionsJson = await generateAuthenticationOptions({ rpID: rpIdOf(request), userVerification: 'required' })
+      const challengeId = randomBytes(24).toString('base64url')
+      signInChallenges.set(challengeId, {
+        challenge: optionsJson.challenge,
+        expiresAt: now() + PASSKEY_CHALLENGE_TTL_MS,
+      })
+      writeJson(response, 200, { challengeId, options: optionsJson })
+      return true
+    }
+    if (pathname === '/api/management/passkey-login') {
+      if (!allowAttempt(clientAddress(request))) {
+        writeProblem(response, 429, 'login_rate_limited', '登录尝试过于频繁，请一分钟后再试。')
+        return true
+      }
+      cleanChallenges()
+      const input = passkeyLoginSchema.parse(await readJson(request))
+      const pending = signInChallenges.get(input.challengeId)
+      signInChallenges.delete(input.challengeId)
+      const credentialId = typeof input.response['id'] === 'string' ? input.response['id'] : ''
+      const passkey = options.repository.getPasskey(credentialId)
+      if (pending === undefined || passkey === undefined || passkey.rpId !== rpIdOf(request)) {
+        writeProblem(response, 401, 'passkey_invalid', '这个通行密钥不能登录这个地址，请换一种方式登录。')
+        return true
+      }
+      const verification = await verifyAuthenticationResponse({
+        response: authenticationResponse(input.response),
+        expectedChallenge: pending.challenge,
+        expectedOrigin: requestOrigin(request),
+        expectedRPID: passkey.rpId,
+        credential: {
+          id: passkey.id,
+          publicKey: Buffer.from(passkey.publicKey, 'base64url'),
+          counter: passkey.counter,
+          ...(passkey.transports === undefined ? {} : { transports: [...passkey.transports] }),
+        },
+        requireUserVerification: true,
+      }).catch(() => ({ verified: false, authenticationInfo: undefined }))
+      if (!verification.verified || verification.authenticationInfo === undefined) {
+        writeProblem(response, 401, 'passkey_invalid', '通行密钥验证没有通过，请重试。')
+        return true
+      }
+      options.repository.usePasskey(passkey.id, verification.authenticationInfo.newCounter, now())
+      signInBrowser(request, response)
+      return true
+    }
+    if (pathname === '/api/management/login-requests') {
+      if (!allowLoginCode(clientAddress(request))) {
+        writeProblem(response, 429, 'login_rate_limited', '登录码申请过于频繁，请一分钟后再试。')
+        return true
+      }
+      const input = z
+        .object({ acknowledgeInsecure: z.boolean().default(false) })
+        .strict()
+        .parse(await readJson(request))
+      if (!secureRequest(request) && !input.acknowledgeInsecure) {
+        writeProblem(response, 400, 'insecure_not_acknowledged', '当前连接未加密，请先确认了解风险。')
+        return true
+      }
+      const created = loginRequests.createRequest(browserDeviceLabel(request.headers['user-agent']))
+      const url = `${shareOrigin(request)}/settings/access?approve=${created.code}`
+      writeJson(response, 200, {
+        code: created.code,
+        secret: created.secret,
+        expiresAt: created.expiresAt,
+        url,
+        qrSvg: await qrSvg(url),
+      })
+      return true
+    }
+    if (pathname === '/api/management/login-requests/claim') {
+      if (!allowAttempt(clientAddress(request))) {
+        writeProblem(response, 429, 'login_rate_limited', '登录尝试过于频繁，请一分钟后再试。')
+        return true
+      }
+      const input = loginCodeSchema.parse(await readJson(request))
+      if (!secureRequest(request) && !input.acknowledgeInsecure) {
+        writeProblem(response, 400, 'insecure_not_acknowledged', '当前连接未加密，请先确认了解风险。')
+        return true
+      }
+      const claimed = loginRequests.claim(input.code, browserDeviceLabel(request.headers['user-agent']))
+      if (claimed === undefined) {
+        writeProblem(response, 404, 'login_code_invalid', '登录码无效或已过期，请在已登录的设备上重新生成。')
+        return true
+      }
+      writeJson(response, 200, {
+        secret: claimed.secret,
+        expiresAt: claimed.expiresAt,
+        requesterLabel: claimed.requesterLabel,
+      })
+      return true
+    }
+    if (pathname === '/api/management/login-requests/poll') {
+      const input = loginPollSchema.parse(await readJson(request))
+      const state = loginRequests.poll(input.secret)
+      if (state !== 'approved') {
+        writeJson(response, 200, { state })
+        return true
+      }
+      signInBrowser(request, response, { state })
+      return true
+    }
+    return false
+  }
+
+  /** Signed-in routes for passkeys, sign-in codes and the key sign-in switch. */
+  const handleSignInSettings = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+    pathname: string,
+    session: { readonly token: string; readonly session: SessionRecord },
+  ): Promise<boolean> => {
+    if (pathname === '/api/management/sign-in') {
+      if (request.method === 'PUT') {
+        const input = z
+          .object({ keySignIn: z.boolean() })
+          .strict()
+          .parse(await readJson(request))
+        options.repository.setKeySignIn(input.keySignIn, now())
+      } else if (request.method !== 'GET') return false
+      writeJson(response, 200, signInView(request))
+      return true
+    }
+    if (request.method === 'POST' && pathname === '/api/management/passkeys/options') {
+      cleanChallenges()
+      if (!passkeysAvailable(request)) {
+        writeProblem(
+          response,
+          400,
+          'passkeys_unavailable',
+          '通行密钥需要通过 HTTPS 的域名访问，或在本机用 localhost 打开。',
+        )
+        return true
+      }
+      const rpID = rpIdOf(request)
+      const optionsJson = await generateRegistrationOptions({
+        rpName: 'NekroNXT',
+        rpID,
+        userName: 'NekroNXT 管理员',
+        userDisplayName: 'NekroNXT 管理员',
+        userID: new TextEncoder().encode(instanceId),
+        attestationType: 'none',
+        excludeCredentials: options.repository.listPasskeys(rpID).map((passkey) => ({
+          id: passkey.id,
+          ...(passkey.transports === undefined ? {} : { transports: [...passkey.transports] }),
+        })),
+        authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+      })
+      registrationChallenges.set(session.token, {
+        challenge: optionsJson.challenge,
+        expiresAt: now() + PASSKEY_CHALLENGE_TTL_MS,
+      })
+      writeJson(response, 200, optionsJson)
+      return true
+    }
+    if (request.method === 'POST' && pathname === '/api/management/passkeys') {
+      cleanChallenges()
+      const input = z
+        .object({ response: z.record(z.string(), z.unknown()), label: z.string().trim().min(1).max(80) })
+        .strict()
+        .parse(await readJson(request))
+      const pending = registrationChallenges.get(session.token)
+      registrationChallenges.delete(session.token)
+      if (pending === undefined) {
+        writeProblem(response, 400, 'passkey_challenge_missing', '添加超时了，请重新添加。')
+        return true
+      }
+      const rpID = rpIdOf(request)
+      const verification = await verifyRegistrationResponse({
+        response: registrationResponse(input.response),
+        expectedChallenge: pending.challenge,
+        expectedOrigin: requestOrigin(request),
+        expectedRPID: rpID,
+        requireUserVerification: true,
+      }).catch(() => ({ verified: false as const, registrationInfo: undefined }))
+      if (!verification.verified) {
+        writeProblem(response, 400, 'passkey_invalid', '通行密钥没有添加成功，请重试。')
+        return true
+      }
+      const credential = verification.registrationInfo.credential
+      const record = options.repository.putPasskey({
+        id: credential.id,
+        rpId: rpID,
+        publicKey: Buffer.from(credential.publicKey).toString('base64url'),
+        counter: credential.counter,
+        ...(credential.transports === undefined ? {} : { transports: [...credential.transports] }),
+        label: input.label,
+        createdAt: now(),
+      })
+      writeJson(response, 200, { id: record.id, label: record.label, rpId: record.rpId, createdAt: record.createdAt })
+      return true
+    }
+    const passkeyMatch = /^\/api\/management\/passkeys\/([^/]+)$/u.exec(pathname)
+    if (request.method === 'DELETE' && passkeyMatch?.[1] !== undefined) {
+      if (!options.repository.deletePasskey(decodeURIComponent(passkeyMatch[1]))) {
+        writeProblem(response, 404, 'not_found', '这个通行密钥已经不存在。')
+        return true
+      }
+      writeJson(response, 200, { deleted: true })
+      return true
+    }
+    if (request.method === 'POST' && pathname === '/api/management/login-invites') {
+      const invite = loginRequests.createInvite()
+      const url = `${shareOrigin(request)}/login?code=${invite.code}`
+      writeJson(response, 200, { code: invite.code, url, qrSvg: await qrSvg(url), expiresAt: invite.expiresAt })
+      return true
+    }
+    const requestMatch = /^\/api\/management\/login-requests\/([^/]+)(\/decision)?$/u.exec(pathname)
+    if (requestMatch?.[1] !== undefined) {
+      const code = decodeURIComponent(requestMatch[1])
+      if (request.method === 'GET' && requestMatch[2] === undefined) {
+        const view = loginRequests.get(code)
+        if (view === undefined) writeProblem(response, 404, 'login_code_invalid', '登录码无效或已过期。')
+        else writeJson(response, 200, view)
+        return true
+      }
+      if (request.method === 'POST' && requestMatch[2] !== undefined) {
+        const input = z
+          .object({ approve: z.boolean() })
+          .strict()
+          .parse(await readJson(request))
+        const decided = loginRequests.decide(code, input.approve, session.session.deviceId)
+        if (decided === undefined)
+          writeProblem(response, 409, 'login_code_not_waiting', '这个登录码没有在等待确认，可能已经过期或处理过了。')
+        else writeJson(response, 200, decided)
+        return true
+      }
+    }
+    return false
+  }
+
+  const developmentWebPort =
+    options.developmentWebOrigin === undefined ? undefined : Number(new URL(options.developmentWebOrigin).port)
+  const builtPages = (request: IncomingMessage): boolean =>
+    options.developmentBuiltPagesForProxy === true && arrivedThroughProxy(request) && viaTrustedProxy(request)
+  const upstreamPort = (request: IncomingMessage): number =>
+    developmentWebPort !== undefined &&
+    !builtPages(request) &&
+    !serverOwnedPath(new URL(request.url ?? '/', 'http://edge.invalid').pathname)
+      ? developmentWebPort
+      : options.internalPort
+
+  /**
+   * Hot updates of the dev server, for a signed-in browser only. The product server has no upgrade routes, so
+   * outside development every upgrade is refused.
+   */
+  const upgrade = (request: IncomingMessage, socket: Duplex, head: Buffer): void => {
+    cleanExpired()
+    const token = parseCookies(request).get(SESSION_COOKIE)
+    const session = token === undefined ? undefined : sessions.get(token)
+    const signedIn =
+      (session !== undefined && options.repository.getActiveDevice(session.deviceId) !== undefined) ||
+      deviceFromCookie(request) !== undefined
+    const pathname = new URL(request.url ?? '/', 'http://edge.invalid').pathname
+    if (stopping || developmentWebPort === undefined || !signedIn || serverOwnedPath(pathname) || builtPages(request)) {
+      socket.end('HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n')
+      return
+    }
+    const upstream = connect(developmentWebPort, '127.0.0.1', () => {
+      const headers = Object.entries(request.headers)
+        .filter(([name]) => name !== VIEWER_HEADER && name !== 'host')
+        .flatMap(([name, value]) => (Array.isArray(value) ? value : [value ?? '']).map((item) => `${name}: ${item}`))
+      upstream.write(
+        [
+          `${request.method ?? 'GET'} ${request.url ?? '/'} HTTP/1.1`,
+          `host: 127.0.0.1:${developmentWebPort}`,
+          ...headers,
+        ]
+          .join('\r\n')
+          .concat('\r\n\r\n'),
+      )
+      if (head.length > 0) upstream.write(head)
+      upstream.pipe(socket)
+      socket.pipe(upstream)
+    })
+    const close = (): void => {
+      upstream.destroy()
+      socket.destroy()
+    }
+    upstream.once('error', close)
+    socket.once('error', close)
+    upstream.once('close', close)
+    socket.once('close', close)
+  }
+
   const proxy = (request: IncomingMessage, response: ServerResponse, viewer: string | undefined): void => {
     if (stopping) {
       writeProblem(response, 503, 'server_stopping', '服务实例正在关闭。')
       return
     }
+    const port = upstreamPort(request)
     const upstream = httpRequest(
       {
         host: '127.0.0.1',
-        port: options.internalPort,
+        port,
         method: request.method,
         path: request.url,
         headers: {
           ...Object.fromEntries(Object.entries(request.headers).filter(([name]) => name !== VIEWER_HEADER)),
-          host: `127.0.0.1:${options.internalPort}`,
+          host: `127.0.0.1:${port}`,
           'x-forwarded-proto': secureRequest(request) ? 'https' : 'http',
           // The edge is the only place that knows the paired device; clients cannot claim another viewer.
           ...(viewer === undefined ? {} : { [VIEWER_HEADER]: viewer }),
@@ -481,7 +1057,7 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
       }
       if (request.method === 'POST' && url.pathname === '/api/management/pairing/challenge') {
         cleanExpired()
-        const address = request.socket.remoteAddress ?? 'unknown'
+        const address = clientAddress(request)
         const recent = challengeRequests.get(address) ?? []
         if (challenges.size >= MAX_PENDING_CHALLENGES || recent.length >= CHALLENGES_PER_ADDRESS_PER_MINUTE) {
           writeProblem(response, 429, 'pairing_rate_limited', '配对请求过于频繁，请稍后重试。')
@@ -557,7 +1133,7 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
         return
       }
       if (request.method === 'POST' && url.pathname === '/api/management/login') {
-        if (!allowAttempt(request.socket.remoteAddress ?? 'unknown')) {
+        if (!allowAttempt(clientAddress(request))) {
           writeProblem(response, 429, 'login_rate_limited', '登录尝试过于频繁，请一分钟后再试。')
           return
         }
@@ -567,33 +1143,37 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
           writeProblem(response, 400, 'insecure_not_acknowledged', '当前连接未加密，请先确认了解风险。')
           return
         }
+        if (!options.repository.keySignIn() && !input.recovery) {
+          writeProblem(
+            response,
+            403,
+            'key_sign_in_off',
+            '这个实例关闭了管理密钥登录，请用通行密钥或扫码登录，或使用找回入口。',
+          )
+          return
+        }
         if (!safeEqual(digest('nxt-login-key', input.managementKey), digest('nxt-login-key', options.managementKey))) {
           writeProblem(response, 401, 'management_key_invalid', '管理密钥不正确。')
           return
         }
-        const deviceId = ManagementDeviceIdSchema.parse(`nxt_device_${nextUlid()}`)
-        const deviceSecret = randomBytes(32).toString('base64url')
-        options.repository.putDevice({
-          id: deviceId,
-          label: browserDeviceLabel(request.headers['user-agent']),
-          secretDigest: digest('nxt-device-secret-v1', deviceSecret),
-          createdAt: now(),
+        // After recovery the browser lands where it can add a passkey or approve other devices.
+        signInBrowser(request, response, input.recovery ? { next: '/settings/access?recovered=1' } : {})
+        return
+      }
+      if (await handlePublicSignIn(request, response, url.pathname)) return
+      if (request.method === 'GET' && url.pathname === LOGIN_QR_DECODER_PATH) {
+        const script = await loadQrDecoderScript()
+        const gzip = /\bgzip\b/u.test(String(request.headers['accept-encoding'] ?? ''))
+        const body = gzip ? script.gzip : script.plain
+        response.writeHead(200, {
+          'content-type': 'text/javascript; charset=utf-8',
+          'cache-control': 'public, max-age=86400',
+          'content-length': body.length,
+          'x-content-type-options': 'nosniff',
+          vary: 'accept-encoding',
+          ...(gzip ? { 'content-encoding': 'gzip' } : {}),
         })
-        const opened = openSession(request, deviceId)
-        writeJson(
-          response,
-          200,
-          { authenticated: true, deviceId },
-          {
-            'set-cookie': [
-              cookie(DEVICE_COOKIE, `${deviceId}.${deviceSecret}`, BROWSER_DEVICE_TTL_MS / 1_000, {
-                httpOnly: true,
-                secure,
-              }),
-              ...opened.cookies,
-            ],
-          },
-        )
+        response.end(body)
         return
       }
       if (request.method === 'GET' && url.pathname === '/login') {
@@ -603,14 +1183,22 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
           response.end()
           return
         }
-        const page = managementLoginPage({ secure: secureRequest(request), next })
+        const rpId = rpIdOf(request)
+        const page = managementLoginPage({
+          secure: secureRequest(request),
+          next,
+          qrDecoder: LOGIN_QR_DECODER_PATH,
+          keySignIn: options.repository.keySignIn(),
+          passkeys: passkeysAvailable(request) && options.repository.listPasskeys(rpId).length > 0,
+          ...(url.searchParams.get('code') === null ? {} : { code: url.searchParams.get('code')! }),
+        })
         response.writeHead(200, {
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'no-store',
           'content-length': Buffer.byteLength(page),
           'x-frame-options': 'DENY',
           'content-security-policy':
-            "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'",
+            "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'",
         })
         response.end(page)
         return
@@ -669,6 +1257,8 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
         )
         return
       }
+      if (authenticated !== undefined && (await handleSignInSettings(request, response, url.pathname, authenticated)))
+        return
       if (request.method === 'GET' && url.pathname === '/api/management/devices') {
         writeJson(response, 200, {
           devices: options.repository.listDevices().map((device) => ({
@@ -705,6 +1295,7 @@ export const startManagementEdge = async (options: ManagementEdgeOptions): Promi
     host: options.host,
     port: options.port,
     handler: handle,
+    upgrade,
     tls: certificate,
   })
   return {
