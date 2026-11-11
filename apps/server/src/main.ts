@@ -472,6 +472,46 @@ const processIsAlive = (pid: number): boolean => {
   }
 }
 
+const upgradeLockOwnerSchema = z
+  .object({
+    format: z.literal('nxt.server-upgrade-lock'),
+    version: z.union([z.literal(1), z.literal(2)]),
+    releaseId: z.string(),
+    pid: z.number().int().positive(),
+    token: z.string().uuid(),
+  })
+  .strict()
+
+const UPGRADE_LOCK_SETTLE_READS = 4
+const UPGRADE_LOCK_SETTLE_DELAY_MS = 50
+
+/**
+ * The lock file is created before its owner is written, so a host killed in between leaves it empty
+ * or cut short. Such a file names no owner and cannot prove anyone is still upgrading: once a writer
+ * has had time to finish, it is what an interrupted upgrade left behind.
+ */
+const readUpgradeLockOwner = async (
+  lockPath: string,
+): Promise<z.infer<typeof upgradeLockOwnerSchema> | 'released' | 'interrupted'> => {
+  for (let read = 0; read < UPGRADE_LOCK_SETTLE_READS; read += 1) {
+    if (read > 0) await new Promise((resolve) => setTimeout(resolve, UPGRADE_LOCK_SETTLE_DELAY_MS))
+    let content: string
+    try {
+      content = await readFile(lockPath, 'utf8')
+    } catch (error) {
+      if (isMissing(error)) return 'released'
+      throw error
+    }
+    try {
+      const owner = upgradeLockOwnerSchema.safeParse(JSON.parse(content))
+      if (owner.success) return owner.data
+    } catch {
+      // Empty or cut short, so not JSON yet; a live writer completes it before the next read.
+    }
+  }
+  return 'interrupted'
+}
+
 const acquireUpgradeFileLock = async (backupRoot: string, releaseId: string): Promise<() => Promise<void>> => {
   const lockPath = path.join(backupRoot, 'upgrade.lock')
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -499,16 +539,13 @@ const acquireUpgradeFileLock = async (backupRoot: string, releaseId: string): Pr
       }
     } catch (error) {
       if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error
-      const current = z
-        .object({
-          format: z.literal('nxt.server-upgrade-lock'),
-          version: z.union([z.literal(1), z.literal(2)]),
-          releaseId: z.string(),
-          pid: z.number().int().positive(),
-          token: z.string().uuid(),
-        })
-        .strict()
-        .parse(JSON.parse(await readFile(lockPath, 'utf8')))
+      const current = await readUpgradeLockOwner(lockPath)
+      if (current === 'released') continue
+      if (current === 'interrupted') {
+        console.log(`[nekro-nxt] 清理上次升级中断留下的锁文件：${lockPath}`)
+        await rename(lockPath, `${lockPath}.stale-${randomUUID()}`)
+        continue
+      }
       if (current.version === 1 && current.pid !== process.pid && processIsAlive(current.pid)) {
         throw new Error(`另一个 NekroNXT 正在升级这个数据目录（PID ${current.pid}，版本 ${current.releaseId}）`)
       }
