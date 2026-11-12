@@ -1,4 +1,4 @@
-import { ChannelIdSchema, HostApiContracts } from '@nekro-nxt/contracts'
+import { ChannelIdSchema, ExtensionIdSchema, ExtensionRevisionIdSchema, HostApiContracts } from '@nekro-nxt/contracts'
 import { chromium, expect, test, type Browser, type Locator, type Page } from '@playwright/test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -68,10 +68,57 @@ const expectClearOfChrome = async (page: Page, item: Locator) => {
   expect(box.y + box.height).toBeLessThanOrEqual(nav.y)
 }
 
-/** The product snapshot with unread messages in 记录员's channel (3) and the unbound one (4), arranged as `view`. */
-const arrangedSnapshot = (view: ListView): Snapshot => ({
-  ...productSnapshot,
-  channels: productSnapshot.channels.map((channel) => ({
+/** The bottom bar's edges once it has come to rest (it may still be sliding in). */
+const barRest = async (page: Page): Promise<{ top: number; bottom: number }> => {
+  const nav = page.getByRole('navigation', { name: '主导航' })
+  const edges = async () => {
+    const box = await nav.boundingBox()
+    return { top: box?.y ?? 0, bottom: (box?.y ?? 0) + (box?.height ?? 0) }
+  }
+  let last = await edges()
+  await expect
+    .poll(async () => {
+      const next = await edges()
+      const still = next.top === last.top
+      last = next
+      return still
+    })
+    .toBe(true)
+  return last
+}
+
+/**
+ * The lowest control inside the page that can be seen, cut to the scroll areas around it: its bottom edge and name.
+ * Controls under a hidden level or scrolled out of their area do not count.
+ */
+const lowestControl = (page: Page) =>
+  page.locator('main').evaluate((root) => {
+    let lowest = { bottom: 0, name: '' }
+    const controls = root.querySelectorAll<HTMLElement>(
+      'a[href], button, input, textarea, [role="switch"], [role="tab"], [role="combobox"]',
+    )
+    for (const node of controls) {
+      if (!node.checkVisibility({ visibilityProperty: true, opacityProperty: true })) continue
+      let { top, bottom } = node.getBoundingClientRect()
+      for (let parent = node.parentElement; parent && parent !== root.parentElement; parent = parent.parentElement) {
+        if (getComputedStyle(parent).overflowY === 'visible') continue
+        const clip = parent.getBoundingClientRect()
+        top = Math.max(top, clip.top)
+        bottom = Math.min(bottom, clip.bottom)
+      }
+      if (bottom - top < 1 || bottom <= lowest.bottom) continue
+      lowest = {
+        bottom,
+        name: node.getAttribute('aria-label') ?? node.textContent?.trim().slice(0, 16) ?? node.tagName,
+      }
+    }
+    return lowest
+  })
+
+/** `base` with unread messages in 记录员's channel (3) and the unbound one (4), arranged as `view`. */
+const arrangedSnapshot = (view: ListView, base: Snapshot = productSnapshot): Snapshot => ({
+  ...base,
+  channels: base.channels.map((channel) => ({
     ...channel,
     activity: {
       ...channel.activity,
@@ -81,27 +128,39 @@ const arrangedSnapshot = (view: ListView): Snapshot => ({
   channelListView: view,
 })
 
+type WorkTreeOrder = Snapshot['workTreeOrder']
+
 /**
- * Serves the channel list arrangement like the host: a save comes back in the next snapshot. `writes` records every
- * other mutating request, so a test can show the list arrangement never touched bindings.
+ * Serves the channel list arrangement and the group order like the host: a save comes back in the next snapshot.
+ * `writes` records every other mutating request, so a test can show the arrangement never touched bindings.
  */
-const serveArrangement = async (page: Page, initial: ListView = emptyView) => {
+const serveArrangement = async (page: Page, initial: ListView = emptyView, base: Snapshot = productSnapshot) => {
   let view = initial
+  let order = base.workTreeOrder
   const saved: ListView[] = []
+  const orders: WorkTreeOrder[] = []
   const writes: string[] = []
   page.on('request', (request) => {
     const path = new URL(request.url()).pathname
-    if (request.method() !== 'GET' && path !== '/api/channel-list-view' && !path.endsWith('/read')) {
+    const arrangement = path === '/api/channel-list-view' || path === '/api/work-tree-order'
+    if (request.method() !== 'GET' && !arrangement && !path.endsWith('/read')) {
       writes.push(`${request.method()} ${path}`)
     }
   })
-  await page.route('**/api/snapshot', (route) => route.fulfill({ json: arrangedSnapshot(view) }))
+  await page.route('**/api/snapshot', (route) =>
+    route.fulfill({ json: arrangedSnapshot(view, { ...base, workTreeOrder: order }) }),
+  )
   await page.route('**/api/channel-list-view', (route) => {
     view = HostApiContracts.updateChannelListView.request.parse(route.request().postDataJSON())
     saved.push(view)
     return route.fulfill({ json: view })
   })
-  return { saved, writes }
+  await page.route('**/api/work-tree-order', (route) => {
+    order = HostApiContracts.putWorkTreeOrder.request.parse(route.request().postDataJSON())
+    orders.push(order)
+    return route.fulfill({ json: order })
+  })
+  return { saved, orders, writes }
 }
 
 const dragTo = async (page: Page, source: Locator, target: Locator): Promise<void> => {
@@ -274,6 +333,8 @@ test.describe('shell, channels and live', () => {
       readonly before?: (page: Page) => Promise<void>
       /** A phone held in the hand: touch input, a mobile viewport and its height. */
       readonly touch?: boolean
+      /** Keeps the one-time 「添加到主屏幕」 hint, which other phone tests have already dismissed. */
+      readonly homeScreenHint?: boolean
     } = {},
   ): Promise<{ page: Page; errors: string[] }> => {
     const snapshot = options.snapshot ?? productSnapshot
@@ -283,6 +344,14 @@ test.describe('shell, channels and live', () => {
     })
     const errors: string[] = []
     page.on('pageerror', (error) => errors.push(String(error)))
+    if (options.touch && !options.homeScreenHint)
+      await page.addInitScript(() => {
+        try {
+          window.localStorage.setItem('nekro-nxt.home-screen-hint', 'dismissed')
+        } catch {
+          // about:blank, which some tests go back to, has no storage.
+        }
+      })
     await page.route('**/api/**', (request) =>
       request.fulfill({ status: 501, json: { error: { code: 'unstubbed', message: 'unstubbed' } } }),
     )
@@ -699,15 +768,124 @@ test.describe('shell, channels and live', () => {
         }
 
         await page.goto(page.url().replace(/\/live$/u, '/channels'))
-        await page.getByRole('button', { name: '全部频道' }).click()
-        const drawer = page.locator('[data-list-drawer="open"] > aside')
-        await expect(drawer.getByText('示例群 24')).toBeVisible()
-        await scrollToEnd(drawer)
-        await expectClearOfChrome(page, drawer.getByText('示例群 24'))
+        const list = page.getByRole('complementary', { name: '频道', exact: true })
+        await expect(list.getByText('示例群 24')).toBeVisible()
+        await scrollToEnd(list)
+        await expectClearOfChrome(page, list.getByText('示例群 24'))
         expect(errors).toEqual([])
       } finally {
         await page.close()
       }
+    }
+  })
+
+  test('on a phone pages run on under the floating bottom bar and every page’s end scrolls clear of it', async () => {
+    // Long pages end near the bar once scrolled; short ones (and the contained log page) end wherever they end.
+    for (const [route, long] of [
+      ['/live', true],
+      ['/channels', true],
+      [`/agents/${targetAgentId}`, true],
+      ['/logs', false],
+      ['/settings/notifications', true],
+      ['/wiring', true],
+      ['/workshop', false],
+    ] as const) {
+      const { page, errors } = await open(route, {
+        snapshot: crowdedSnapshot,
+        width: 393,
+        touch: true,
+        before: notched,
+      })
+      try {
+        const nav = page.getByRole('navigation', { name: '主导航' })
+        await expect(nav).toBeVisible()
+        await expect.poll(async () => (await lowestControl(page)).bottom).toBeGreaterThan(0)
+        await page.waitForTimeout(300)
+        // The bar floats over the page: the page reaches the screen edge and the bar lies inside it.
+        const main = await page.locator('main').boundingBox()
+        const bar = await barRest(page)
+        expect(Math.round((main?.y ?? 0) + (main?.height ?? 0)), route).toBe(852)
+        expect(bar.top, route).toBeGreaterThan(main?.y ?? 0)
+        expect(bar.bottom, route).toBeLessThanOrEqual(852 - 34)
+        await scrollToEnd(page.locator('main'))
+        const lowest = await lowestControl(page)
+        if (long) expect(lowest.bottom, `${route} ${lowest.name}`).toBeGreaterThan(bar.top - 160)
+        expect(lowest.bottom, `${route} ${lowest.name}`).toBeLessThanOrEqual(bar.top)
+        expect(errors, route).toEqual([])
+      } finally {
+        await page.close()
+      }
+    }
+  })
+
+  test('on a phone toasts and a page’s save bar stay above the floating bottom bar', async () => {
+    const { page } = await open('/settings/notifications', { width: 393, touch: true })
+    try {
+      const nav = page.getByRole('navigation', { name: '主导航' })
+      await expect(nav).toBeVisible()
+      const bar = await barRest(page)
+      await page.getByRole('switch', { name: '扩展通知' }).click()
+      const save = page.getByRole('region', { name: '未保存的修改' })
+      await expect(save).toBeVisible()
+      // At the top of the page the save bar holds to the bottom of the view, clear of the bar.
+      await page.locator('main').evaluate((root) => {
+        for (const node of root.querySelectorAll<HTMLElement>('*')) node.scrollTop = 0
+      })
+      const saveBox = await save.boundingBox()
+      expect((saveBox?.y ?? 0) + (saveBox?.height ?? 0)).toBeLessThanOrEqual(bar.top)
+      await page.getByRole('button', { name: '保存' }).click()
+      // The unstubbed host refuses the save; its toast rises above the bar.
+      const toast = page.getByText('操作失败', { exact: false }).last()
+      await expect(toast).toBeVisible()
+      const toastBox = await toast.boundingBox()
+      expect((toastBox?.y ?? 0) + (toastBox?.height ?? 0)).toBeLessThanOrEqual(bar.top)
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('back from a conversation the list keeps its place while the bottom bar slides back over it', async () => {
+    const { page, errors } = await open(`/channels/${externalChannelId}`, { width: 393, touch: true })
+    try {
+      await expect(page.getByRole('textbox', { name: '消息' })).toBeVisible()
+      await page.getByRole('button', { name: '返回频道列表' }).click()
+      const row = page.getByRole('complementary', { name: '频道', exact: true }).getByRole('link').first()
+      await expect(row).toBeVisible()
+      const at = async () => {
+        const box = await row.boundingBox()
+        return { y: box?.y ?? 0, height: box?.height ?? 0 }
+      }
+      const first = await at()
+      // The page keeps its height a little after the bar is back; the list must not move when it lets go.
+      await page.waitForTimeout(700)
+      expect(await at()).toEqual(first)
+      const main = await page.locator('main').boundingBox()
+      expect(Math.round((main?.y ?? 0) + (main?.height ?? 0))).toBe(852)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('computers keep the page between the top bar and the status bar, with nothing floating over it', async () => {
+    const { page, errors } = await open('/live', { snapshot: crowdedSnapshot })
+    try {
+      const status = page.getByRole('contentinfo')
+      await expect(status).toBeVisible()
+      const main = await page.locator('main').boundingBox()
+      const footer = await status.boundingBox()
+      expect(Math.round((main?.y ?? 0) + (main?.height ?? 0))).toBe(Math.round(footer?.y ?? 0))
+      expect(
+        await page.evaluate(() =>
+          getComputedStyle(document.documentElement).getPropertyValue('--content-inset-bottom').trim(),
+        ),
+      ).toBe('0px')
+      await scrollToEnd(page.locator('main'))
+      const lowest = await lowestControl(page)
+      expect(lowest.bottom).toBeLessThanOrEqual(footer?.y ?? 0)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
     }
   })
 
@@ -716,6 +894,8 @@ test.describe('shell, channels and live', () => {
     try {
       await expect(page.getByRole('textbox', { name: '消息' })).toBeVisible()
       await expectPinnedDocument(page)
+      expect(await fieldFonts(page)).toContainEqual({ field: '消息', size: 16 })
+      await page.getByRole('button', { name: '返回频道列表' }).click()
       await page.getByRole('button', { name: '搜索' }).click()
       await expect(page.getByPlaceholder('搜索频道、智能体或操作')).toBeVisible()
       // Keys mean nothing without a keyboard: the palette lists none.
@@ -758,7 +938,7 @@ test.describe('shell, channels and live', () => {
     }
   })
 
-  test('on a phone the channel header and the drawer cut long names with an ellipsis, never into vertical text', async () => {
+  test('on a phone the top bar and the channel list cut long names with an ellipsis, never into vertical text', async () => {
     const { page, errors } = await open(`/channels/${sourceChannelId}`, {
       snapshot: longNamesSnapshot,
       width: 393,
@@ -774,18 +954,19 @@ test.describe('shell, channels and live', () => {
           const fits = node.scrollWidth <= node.clientWidth
           return oneLine && (fits || style.textOverflow === 'ellipsis')
         })
-      const header = page.locator('header').filter({ has: page.getByRole('heading', { level: 1 }) })
-      const title = header.getByRole('heading', { level: 1 }).locator('span').first()
-      await expect(title).toHaveText(/一个非常非常长的群聊名称/u)
+      // The conversation's name and state head the top bar, each on one line within its 48px.
+      const bar = page.locator('header').first()
+      const title = bar.getByText(/一个非常非常长的群聊名称/u)
+      await expect(title).toBeVisible()
       expect(await cutOnOneLine(title)).toBe(true)
-      // The name gets the whole first line: nothing else shares it.
-      const titleBox = await title.boundingBox()
-      expect(titleBox?.width ?? 0).toBeGreaterThan(200)
-      expect(await cutOnOneLine(header.getByText(/一个名字特别特别长/u))).toBe(true)
+      expect((await title.boundingBox())?.width ?? 0).toBeGreaterThan(160)
+      const status = bar.getByText(/一个名字特别特别长/u)
+      expect(await cutOnOneLine(status)).toBe(true)
+      expect((await bar.boundingBox())?.height ?? 0).toBe(48)
 
-      await page.getByRole('button', { name: '全部频道' }).click()
-      const drawer = page.locator('[data-list-drawer="open"] > aside')
-      const group = drawer.locator('[aria-roledescription="可拖动的智能体分组"]', { hasText: '一个名字特别特别长' })
+      await bar.getByRole('button', { name: '返回频道列表' }).click()
+      const list = page.getByRole('complementary', { name: '频道', exact: true })
+      const group = list.locator('button[class*="groupHead"]', { hasText: '一个名字特别特别长' })
       await expect(group).toBeVisible()
       expect(await cutOnOneLine(group.getByText(/一个名字特别特别长/u))).toBe(true)
       const state = group.getByText('空闲', { exact: true })
@@ -796,7 +977,7 @@ test.describe('shell, channels and live', () => {
     }
   })
 
-  test('the keyboard takes the bottom bar’s place and the composer stays right above it', async () => {
+  test('the keyboard takes the page’s lower part and the composer stays right above it', async () => {
     const { page, errors } = await open(`/channels/${externalChannelId}`, {
       width: 393,
       touch: true,
@@ -808,16 +989,19 @@ test.describe('shell, channels and live', () => {
       const log = page.getByRole('log', { name: '消息记录' })
       await input.fill('示例消息'.repeat(40))
       await input.focus()
+      // The row is add, field, send: who sends it is not a mark a finger could never read.
+      await expect(composer.getByRole('img', { name: /发出$/u })).toHaveCount(0)
+      // A phone with a home indicator: the keyboard covers it, so no room is kept for it.
+      await page.evaluate(() => document.documentElement.style.setProperty('--safe-bottom', '34px'))
       const before = await log.boundingBox()
       await raiseKeyboard(page, 336)
       await expect(page.locator('html')).toHaveAttribute('data-keyboard', 'open')
-      await expect(page.getByRole('navigation', { name: '主导航' })).toBeHidden()
       const visible = 852 - 336
       const box = await composer.boundingBox()
       const after = await log.boundingBox()
       const bottom = (box?.y ?? 0) + (box?.height ?? 0)
       expect(bottom).toBeLessThanOrEqual(visible)
-      expect(bottom).toBeGreaterThan(visible - 40)
+      expect(bottom).toBeGreaterThan(visible - 16)
       expect(after?.height ?? 0).toBeLessThan(before?.height ?? 0)
       // Long text stops growing before it crowds out the messages.
       expect(after?.height ?? 0).toBeGreaterThan((await input.boundingBox())?.height ?? 0)
@@ -842,21 +1026,34 @@ test.describe('shell, channels and live', () => {
       await input.blur()
       await raiseKeyboard(page, 0)
       await expect(page.locator('html')).not.toHaveAttribute('data-keyboard', 'open')
+      // Back to the full height: a conversation has no bottom bar, so the composer returns to the screen edge.
+      await expect(page.getByRole('navigation', { name: '主导航' })).toBeHidden()
+      const rested = await composer.boundingBox()
+      const restedBottom = (rested?.y ?? 0) + (rested?.height ?? 0)
+      expect(restedBottom).toBeLessThanOrEqual(852 - 34)
+      // Back above the home indicator.
+      expect(restedBottom).toBeGreaterThan(852 - 34 - 24)
+      expect(await page.evaluate(() => window.scrollY)).toBe(0)
+
+      // The bottom bar comes back with the channel list, where the keyboard left it.
+      await page.getByRole('button', { name: '返回频道列表' }).click()
       const nav = page.getByRole('navigation', { name: '主导航' })
       await expect(nav).toBeVisible()
-      // Back to the full height: the bottom bar sits just above the screen edge again, with nothing left below it.
-      const bar = await nav.boundingBox()
-      const barBottom = (bar?.y ?? 0) + (bar?.height ?? 0)
-      expect(barBottom).toBeLessThanOrEqual(852)
-      expect(barBottom).toBeGreaterThan(852 - 24)
-      expect(await page.evaluate(() => window.scrollY)).toBe(0)
+      // It slides back up; measure where it lands.
+      const barBottom = async () => {
+        const bar = await nav.boundingBox()
+        return (bar?.y ?? 0) + (bar?.height ?? 0)
+      }
+      await expect.poll(barBottom).toBeLessThanOrEqual(852 - 34 + 0.5)
+      expect(await barBottom()).toBeGreaterThan(852 - 34 - 24)
+      await expect(nav.locator('> span[aria-hidden="true"]').first()).toHaveCSS('opacity', '1')
       expect(errors).toEqual([])
     } finally {
       await page.close()
     }
   })
 
-  test('a long press on interface controls opens no system menu, while message text stays selectable', async () => {
+  test('a long press on the interface selects nothing and opens no system menu, while message text stays selectable', async () => {
     const { page } = await open(`/channels/${externalChannelId}`, {
       width: 393,
       touch: true,
@@ -885,9 +1082,11 @@ test.describe('shell, channels and live', () => {
       // Chromium has no long-press menu, so it drops -webkit-touch-callout; tokens.css sets it beside user-select
       // (tests/pwa-head.spec.ts), and user-select shows which side of the line each element is on.
       const select = (locator: Locator) => locator.evaluate((node) => getComputedStyle(node).userSelect)
-      const nav = page.getByRole('navigation', { name: '主导航' })
-      expect(await select(nav.getByRole('link', { name: '频道' }))).toBe('none')
-      expect(await select(page.getByRole('button', { name: '搜索' }))).toBe('none')
+      const nav = page.locator('nav[aria-label="主导航"]')
+      expect(await select(nav.getByRole('link', { name: '频道', includeHidden: true }))).toBe('none')
+      expect(await select(page.getByRole('button', { name: '返回频道列表' }))).toBe('none')
+      // Plain interface text and empty space do not select either (Android would offer text recognition on it).
+      expect(await select(page.locator('body'))).toBe('none')
       const text = page.getByText('可以长按复制的示例消息')
       await expect(text).toBeVisible()
       expect(await select(text)).toBe('text')
@@ -901,8 +1100,7 @@ test.describe('shell, channels and live', () => {
   const bottomBar = (page: Page) => {
     // By selector: an open modal menu hides the bar from the accessibility tree.
     const nav = page.locator('nav[aria-label="主导航"]')
-    const item = (name: string) =>
-      name === '更多' ? nav.getByRole('button', { name: '更多' }) : nav.getByRole('link', { name, exact: true })
+    const item = (name: string) => nav.getByRole('link', { name, exact: true })
     const center = async (name: string) => {
       const box = await item(name).boundingBox()
       if (!box) throw new Error(`${name} is not on the bar`)
@@ -966,12 +1164,15 @@ test.describe('shell, channels and live', () => {
       const bar = bottomBar(page)
       await expect(bar.item('概览')).toHaveAttribute('aria-current', 'page')
       await page.evaluate(() => {
-        const original = history.pushState.bind(history)
-        const pushed: string[] = []
-        Object.assign(window, { pushedForTest: pushed })
-        history.pushState = (...args: Parameters<History['pushState']>) => {
-          pushed.push(String(args[2]))
-          original(...args)
+        const navigated: string[] = []
+        Object.assign(window, { navigatedForTest: navigated })
+        // Entries the app writes with an address; the shell's own notes on an entry pass none.
+        for (const method of ['pushState', 'replaceState'] as const) {
+          const original = history[method].bind(history)
+          history[method] = (...args: Parameters<History['pushState']>) => {
+            if (args[2] !== undefined) navigated.push(`${method} ${String(args[2])}`)
+            original(...args)
+          }
         }
       })
       const workshop = await bar.center('工坊')
@@ -985,8 +1186,9 @@ test.describe('shell, channels and live', () => {
       await expect(page).toHaveURL(/\/workshop/u)
       await expect(bar.item('工坊')).toHaveAttribute('aria-current', 'page')
       await expect.poll(async () => (await bar.indicatorX()).shown).toBeCloseTo(await bar.left('工坊'), 0)
-      expect(await page.evaluate(() => (window as Window & { pushedForTest?: string[] }).pushedForTest)).toEqual([
-        '/workshop',
+      // One switch, in place of the overview's entry (05 §6.2: the bottom bar adds no history).
+      expect(await page.evaluate(() => (window as Window & { navigatedForTest?: string[] }).navigatedForTest)).toEqual([
+        'replaceState /workshop',
       ])
       expect(errors).toEqual([])
     } finally {
@@ -1015,32 +1217,89 @@ test.describe('shell, channels and live', () => {
     }
   })
 
-  test('on a phone a drag released on “更多” opens its menu, as a tap does', async () => {
-    const { page } = await open('/live', { width: 393, touch: true })
+  test('on a phone pages outside the bottom bar select nothing there, and 设置 sits in it', async () => {
+    const { page, errors } = await open('/live', { width: 393, touch: true })
     try {
       const bar = bottomBar(page)
       await expect(bar.item('概览')).toHaveAttribute('aria-current', 'page')
-      // An open menu hides the page from assistive technology, so measure first.
-      const overview = await bar.left('概览')
-      await bar.drag('频道', await bar.center('更多'))
-      await page.mouse.up()
-      const menu = page.getByRole('menu', { name: '更多' })
-      await expect(menu).toBeVisible()
-      await expect(page).toHaveURL(/\/live$/u)
-      await expect.poll(async () => (await bar.indicatorX()).shown).toBeCloseTo(overview, 0)
-      await page.keyboard.press('Escape')
-      await expect(menu).toBeHidden()
+      await expect(bar.nav.getByRole('link')).toHaveText(['概览', '频道', '智能体', '工坊', '设置'], {
+        useInnerText: true,
+      })
+      await expect(bar.nav.getByRole('button')).toHaveCount(0)
+      const indicator = bar.nav.locator('> span[aria-hidden="true"]').first()
+      for (const name of ['接线', '社区', '日志']) {
+        await page.getByRole('banner').getByRole('button', { name: '菜单' }).click()
+        await page.getByRole('dialog', { name: '菜单' }).getByRole('link', { name, exact: true }).click()
+        await expect(page.getByRole('banner')).toContainText(name)
+        await expect(bar.nav.locator('[aria-current="page"]')).toHaveCount(0)
+        await expect(indicator).toHaveCSS('opacity', '0')
+      }
+      const settings = await bar.center('设置')
+      await page.touchscreen.tap(settings.x, settings.y)
+      await expect(page).toHaveURL(/\/settings/u)
+      await expect(bar.item('设置')).toHaveAttribute('aria-current', 'page')
+      await expect(indicator).toHaveCSS('opacity', '1')
+      await expect.poll(async () => (await bar.indicatorX()).shown).toBeCloseTo(await bar.left('设置'), 0)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
 
-      const more = await bar.center('更多')
-      await page.touchscreen.tap(more.x, more.y)
-      await expect(menu).toBeVisible()
-      await menu.getByRole('menuitem', { name: '接线' }).click()
-      await expect(page).toHaveURL(/\/wiring/u)
-      await expect(bar.item('更多')).toHaveAttribute('aria-current', 'page')
-      // “更多” holds the page, so it carries the selection; the hidden 接线 entry does not claim it.
-      await expect(bar.nav.locator('[aria-current="page"]')).toHaveCount(1)
-      await expect.poll(async () => (await bar.indicatorX()).shown).toBeCloseTo(await bar.left('更多'), 0)
-      await expect(bar.nav.locator('> span[aria-hidden="true"]').first()).toHaveCSS('opacity', '1')
+  test('on a phone browser it offers adding to the home screen once, and the side menu keeps the way there', async () => {
+    const { page, errors } = await open('/live', { width: 393, touch: true, homeScreenHint: true })
+    try {
+      const hint = page.locator('[data-home-screen-hint]')
+      await expect(hint).toContainText('添加到主屏幕，像应用一样全屏打开')
+      await hint.getByRole('button', { name: '不用了' }).click()
+      await expect(hint).toHaveCount(0)
+      await page.reload()
+      await expect(page.getByRole('banner')).toBeVisible()
+      await expect(hint).toHaveCount(0)
+      // Without an install dialog from the browser, the side menu shows the steps for the browser's own menu.
+      await page.getByRole('banner').getByRole('button', { name: '菜单' }).click()
+      await page.getByRole('dialog', { name: '菜单' }).getByRole('button', { name: '添加到主屏幕' }).click()
+      const guide = page.getByRole('dialog', { name: '添加到主屏幕' })
+      await expect(guide).toContainText('选「安装应用」或「添加到主屏幕」')
+      await guide.getByRole('button', { name: '关闭' }).click()
+      // Chrome's install dialog, once offered, opens instead of the steps.
+      await page.evaluate(() => {
+        const event = Object.assign(new Event('beforeinstallprompt', { cancelable: true }), {
+          prompt: () => {
+            document.documentElement.dataset['installPrompted'] = 'true'
+            return Promise.resolve()
+          },
+          userChoice: Promise.resolve({ outcome: 'accepted' }),
+        })
+        window.dispatchEvent(event)
+      })
+      await page.getByRole('banner').getByRole('button', { name: '菜单' }).click()
+      await page.getByRole('dialog', { name: '菜单' }).getByRole('button', { name: '添加到主屏幕' }).click()
+      await expect(page.locator('html')).toHaveAttribute('data-install-prompted', 'true')
+      await expect(guide).toHaveCount(0)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on an address the browser cannot install, the side menu explains HTTPS and offers no hint', async () => {
+    const { page, errors } = await open('/live', {
+      width: 393,
+      touch: true,
+      homeScreenHint: true,
+      before: async (page) => {
+        await page.context().route('**/sw.js', (request) => request.fulfill({ status: 404, body: '' }))
+      },
+    })
+    try {
+      await page.getByRole('banner').getByRole('button', { name: '菜单' }).click()
+      await page.getByRole('dialog', { name: '菜单' }).getByRole('button', { name: '添加到主屏幕' }).click()
+      const guide = page.getByRole('dialog', { name: '添加到主屏幕' })
+      await expect(guide).toContainText('受信任的 HTTPS 地址')
+      await expect(guide.getByRole('link', { name: '怎么设置 HTTPS' })).toBeVisible()
+      await expect(page.locator('[data-home-screen-hint]')).toHaveCount(0)
+      expect(errors).toEqual([])
     } finally {
       await page.close()
     }
@@ -1056,14 +1315,10 @@ test.describe('shell, channels and live', () => {
       await expect(page).toHaveURL(/\/channels/u)
       await expect(bar.item('频道')).toHaveAttribute('aria-current', 'page')
       await expect.poll(async () => (await bar.indicatorX()).shown).toBeCloseTo(await bar.left('频道'), 0)
-      await bar.item('更多').focus()
+      await bar.item('设置').focus()
       await page.keyboard.press('Enter')
-      const menu = page.getByRole('menu', { name: '更多' })
-      await expect(menu).toBeVisible()
-      await expect(menu.getByRole('menuitem').first()).toBeFocused()
-      await page.keyboard.press('Enter')
-      await expect(menu).toBeHidden()
-      await expect(page).toHaveURL(/\/(?:community|wiring|apps|logs|settings)/u)
+      await expect(page).toHaveURL(/\/settings/u)
+      await expect(bar.item('设置')).toHaveAttribute('aria-current', 'page')
     } finally {
       await page.close()
     }
@@ -1109,6 +1364,1130 @@ test.describe('shell, channels and live', () => {
       await expect(bar.item('工坊')).toHaveAttribute('aria-current', 'page')
       await expect(bar.nav.locator('[data-steer]')).toHaveCount(0)
       await expect.poll(async () => (await bar.indicatorX()).shown).toBeCloseTo(await bar.left('工坊'), 0)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  /** The phone's top bar: its title, the back arrow when the page has one, and the bar itself. */
+  const topBar = (page: Page) => {
+    const bar = page.locator('header').first()
+    return { bar, back: (name: string) => bar.getByRole('button', { name }) }
+  }
+
+  test('on a phone the channel list is a page of its own and a conversation the level above it', async () => {
+    const { page, errors } = await open('/channels', { width: 393, touch: true })
+    try {
+      const { bar, back } = topBar(page)
+      const nav = page.getByRole('navigation', { name: '主导航' })
+      const list = page.getByRole('complementary', { name: '频道', exact: true })
+      // The list is the first level: no conversation opens by itself. A finger does not drag, so rows stay links.
+      const sortable = list.getByRole('link', { name: /^资料员的内置频道 内置频道/u })
+      await expect(sortable).toBeVisible()
+      await page.waitForTimeout(300)
+      await expect(page).toHaveURL(/\/channels$/u)
+      await expect(bar).toContainText('频道')
+      await expect(nav).toBeVisible()
+      await expect(nav.getByRole('link', { name: '频道', exact: true })).toHaveAttribute('aria-current', 'page')
+      await expect(page.getByRole('button', { name: '全部频道' })).toBeHidden()
+      // A whole page: rows run to the page margin and are a fingertip tall.
+      const row = await sortable.boundingBox()
+      expect(row?.x ?? 0).toBe(0)
+      expect(row?.height ?? 0).toBeGreaterThanOrEqual(56)
+
+      await list.getByRole('searchbox', { name: '搜索频道' }).fill('资料员')
+      await list.getByRole('link', { name: /资料员的内置频道/u }).click()
+      await expect(page).toHaveURL(new RegExp(`/channels/${targetChannelId}$`, 'u'))
+      await expect(bar).toContainText('资料员的内置频道')
+      await expect(bar).toContainText('空闲 · 资料员')
+      await expect(back('返回频道列表')).toBeVisible()
+      // The conversation takes the whole height: no bottom bar, no instance, search or bell in the top bar.
+      await expect(nav).toBeHidden()
+      await expect(bar.getByRole('button', { name: '搜索' })).toHaveCount(0)
+      await expect(bar.getByRole('button', { name: '透视' })).toBeVisible()
+      await expect(bar.getByRole('button', { name: '频道信息' })).toBeVisible()
+      const backBox = await back('返回频道列表').boundingBox()
+      expect(backBox?.width ?? 0).toBeGreaterThanOrEqual(44)
+      expect(backBox?.height ?? 0).toBeGreaterThanOrEqual(44)
+      // Only one level-1 heading, read out but not drawn twice.
+      await expect(page.getByRole('heading', { level: 1 })).toHaveCount(1)
+      await expect(page.getByRole('heading', { level: 1 })).toContainText('资料员的内置频道')
+
+      // One row: add, the field, send; no taller than 60px around it.
+      const input = page.getByRole('textbox', { name: '消息' })
+      await expect(input).toHaveAttribute('placeholder', '发消息')
+      await expect(input).toHaveAttribute('enterkeyhint', 'send')
+      await expect(page.getByRole('button', { name: '添加图片' })).toHaveCount(0)
+      const add = page.getByRole('button', { name: '添加附件' })
+      const send = page.getByRole('button', { name: '发送' })
+      const [addBox, inputBox, sendBox] = await Promise.all([
+        add.boundingBox(),
+        input.boundingBox(),
+        send.boundingBox(),
+      ])
+      expect(
+        Math.abs((addBox?.y ?? 0) + (addBox?.height ?? 0) - ((sendBox?.y ?? 0) + (sendBox?.height ?? 0))),
+      ).toBeLessThan(4)
+      expect(inputBox?.x ?? 0).toBeGreaterThan((addBox?.x ?? 0) + (addBox?.width ?? 0))
+      expect(inputBox?.x ?? 0).toBeLessThan(sendBox?.x ?? 0)
+      const dock = await page.getByRole('form', { name: '消息输入' }).evaluate((form) => {
+        const box = form.parentElement?.getBoundingClientRect()
+        return { height: box?.height ?? 0, bottom: box?.bottom ?? 0 }
+      })
+      expect(dock.height).toBeLessThanOrEqual(60)
+      expect(dock.bottom).toBeGreaterThan(852 - 2)
+      const log = await page.getByRole('log', { name: '消息记录' }).boundingBox()
+      expect(log?.height ?? 0).toBeGreaterThanOrEqual(700)
+
+      // “添加” goes straight to the system's chooser, which offers the photo library, camera and files itself.
+      const [chooser] = await Promise.all([page.waitForEvent('filechooser'), add.click()])
+      expect(chooser.isMultiple()).toBe(true)
+      await expect(page.getByRole('dialog', { name: /添加附件/u })).toHaveCount(0)
+
+      // Back is a real history step to the list, which kept its search.
+      await back('返回频道列表').click()
+      await expect(page).toHaveURL(/\/channels$/u)
+      await expect(nav).toBeVisible()
+      await expect(list.getByRole('searchbox', { name: '搜索频道' })).toHaveValue('资料员')
+      await expect(bar.getByRole('button', { name: '搜索' })).toBeVisible()
+      await page.goForward()
+      await expect(page).toHaveURL(new RegExp(`/channels/${targetChannelId}$`, 'u'))
+      await page.goBack()
+      await expect(page).toHaveURL(/\/channels$/u)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  /** A finger on the page through CDP touch events: Playwright's tap cannot hold still or slide. */
+  const finger = async (page: Page) => {
+    const session = await page.context().newCDPSession(page)
+    const send = (type: 'touchStart' | 'touchMove' | 'touchEnd', point?: { x: number; y: number }) =>
+      session.send('Input.dispatchTouchEvent', { type, touchPoints: point ? [point] : [] })
+    const centre = async (target: Locator) => {
+      const box = await target.boundingBox()
+      if (!box) throw new Error('The touch target has no box.')
+      return { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+    }
+    // The open one: a sheet just chosen from is still leaving while the next press begins.
+    const sheet = page.locator('[role="dialog"][data-state="open"]')
+    return {
+      sheet,
+      /** Slides up from `target`'s centre by `distance` in small steps, then lifts. */
+      swipe: async (target: Locator, distance: number) => {
+        const { x, y } = await centre(target)
+        await send('touchStart', { x, y })
+        for (let step = 1; step <= 8; step++) await send('touchMove', { x, y: y - (step * distance) / 8 })
+        await send('touchEnd')
+      },
+      /**
+       * Puts a finger on `target` and moves it down by `distance` (up when negative) a frame at a time, as a hand
+       * would; `held` runs before it lifts, while the row is still raised.
+       */
+      drag: async (target: Locator, distance: number, held?: () => Promise<void>) => {
+        const { x, y } = await centre(target)
+        await send('touchStart', { x, y })
+        const steps = 20
+        for (let step = 1; step <= steps; step++) {
+          await send('touchMove', { x, y: y + (step * distance) / steps })
+          await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => done(null))))
+        }
+        await held?.()
+        await send('touchEnd')
+      },
+      /**
+       * Rests on `target` until its actions sheet is up, then lifts. Waiting for the sheet rather than a fixed time
+       * keeps the hold long enough however busy the machine is.
+       */
+      hold: async (target: Locator) => {
+        // A sheet just chosen from still dims the page as it leaves and would take the press.
+        await expect(page.getByRole('dialog')).toHaveCount(0)
+        await send('touchStart', await centre(target))
+        await expect(sheet).toBeVisible()
+        await send('touchEnd')
+      },
+    }
+  }
+
+  /** The channel ids of the rows inside `scope`, in order. */
+  const rowIds = (scope: Locator) =>
+    scope
+      .locator('a[href^="/channels/"]')
+      .evaluateAll((links) => links.map((link) => link.getAttribute('href')?.split('/').at(-1) ?? ''))
+
+  test('on a phone a finger scrolls the channel list, and a held row opens its actions instead of the conversation', async () => {
+    const { page, errors } = await open('/channels', { width: 393, touch: true, snapshot: crowdedSnapshot })
+    try {
+      const list = page.getByRole('complementary', { name: '频道', exact: true })
+      const row = list.locator('a[href^="/channels/"]').filter({ hasText: /^示例群 3(?!\d)/u })
+      await expect(row).toBeVisible()
+      // A finger never drags, so the rows do not offer it.
+      await expect(list.locator('[aria-roledescription]')).toHaveCount(0)
+      const touch = await finger(page)
+      const scrolled = () =>
+        list.evaluate((node) => Math.max(...[node, ...node.querySelectorAll('*')].map((item) => item.scrollTop)))
+
+      // Resting on a row opens its actions; letting go stays on the list.
+      await touch.hold(row)
+      await expect(touch.sheet).toHaveAccessibleName('示例群 3')
+      await page.waitForTimeout(300)
+      await expect(touch.sheet).toBeVisible()
+      await expect(page).toHaveURL(/\/channels$/u)
+      // Android's long-press menu for the link does not open.
+      expect(
+        await row.evaluate(
+          (node) => !node.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true })),
+        ),
+      ).toBe(true)
+      // An unbound row: it pins, sorts, and can be given to an agent; there is nothing to unbind.
+      await expect(touch.sheet.getByRole('button')).toHaveText(['置顶', '排序', '接到智能体…'])
+      await page.keyboard.press('Escape')
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+
+      // A swipe that starts on a row moves the list and opens nothing, even after a hold's worth of waiting.
+      await touch.swipe(row, 160)
+      await expect.poll(scrolled).toBeGreaterThan(40)
+      await page.waitForTimeout(800)
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+      await expect(page).toHaveURL(/\/channels$/u)
+      // A tap still opens the conversation.
+      await row.tap()
+      await expect(page).toHaveURL(/\/channels\/chn_crowd02$/u)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  /** Whether nothing inside `target` (the element and every descendant) can be selected, by either property. */
+  const unselectable = (target: Locator) =>
+    target.evaluate((root) =>
+      [root, ...root.querySelectorAll('*')].every((node) => {
+        const style = getComputedStyle(node)
+        return style.userSelect === 'none' && style.getPropertyValue('-webkit-user-select') === 'none'
+      }),
+    )
+
+  test('on a phone rows draw no more button, and screen readers still reach every row’s and group’s actions', async () => {
+    const { page, errors } = await open('/channels', { width: 393, touch: true, snapshot: arrangedSnapshot(emptyView) })
+    try {
+      const list = page.getByRole('complementary', { name: '频道', exact: true })
+      const row = list.locator(`a[href="/channels/${externalChannelId}"]`)
+      await expect(row).toBeVisible()
+      // Nothing is drawn for them: each sits in a 1px box that clips it away.
+      const more = list.getByRole('button', { name: /的更多操作$/u })
+      expect(await more.count()).toBeGreaterThan(2)
+      const shown = await more.evaluateAll((nodes) =>
+        nodes.map((node) => {
+          const box = node.parentElement?.getBoundingClientRect()
+          return {
+            area: (box?.width ?? 0) * (box?.height ?? 0),
+            clip: getComputedStyle(node.parentElement ?? node).clipPath,
+          }
+        }),
+      )
+      for (const item of shown) expect(item).toEqual({ area: 1, clip: 'inset(50%)' })
+      // The row's time and unread count run to the page margin.
+      const edge = async (selector: string) => {
+        const box = await row.locator(selector).boundingBox()
+        return Math.round((box?.x ?? 0) + (box?.width ?? 0))
+      }
+      expect(await edge('[class*="rowTime"]')).toBe(393 - 16)
+      expect(await edge('[class*="rowBadge"]')).toBe(393 - 16)
+
+      // A screen reader (or a keyboard) reaches the same sheet a long press opens.
+      const sheet = page.locator('[role="dialog"][data-state="open"]')
+      await list.getByRole('button', { name: '产品讨论群 的更多操作' }).focus()
+      await page.keyboard.press('Enter')
+      await expect(sheet).toHaveAccessibleName('产品讨论群')
+      await expect(sheet.getByRole('button')).toHaveText(['置顶', '排序', '接到智能体…'])
+      await page.keyboard.press('Escape')
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+      // An agent's group too: until now only a long press reached it.
+      await list.getByRole('button', { name: '记录员 的更多操作' }).focus()
+      await page.keyboard.press('Enter')
+      await expect(sheet).toHaveAccessibleName('记录员')
+      await expect(sheet.getByRole('button')).toHaveText(['排序'])
+      await page.keyboard.press('Escape')
+      await expect(page).toHaveURL(/\/channels$/u)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone a held row, its group head and its raised copy select no text', async () => {
+    const { page, errors } = await open('/channels', { width: 393, touch: true })
+    try {
+      const list = page.getByRole('complementary', { name: '频道', exact: true })
+      const touch = await finger(page)
+      const row = list.locator(`a[href="/channels/${sourceChannelId}"]`)
+      await expect(row).toBeVisible()
+      expect(await unselectable(row.locator('..'))).toBe(true)
+      expect(await unselectable(list.locator('[class*="groupHeadRow"]').first())).toBe(true)
+      // A selection already on the page goes when a hold opens the actions.
+      await page.evaluate(() => {
+        const range = document.createRange()
+        range.selectNodeContents(document.body)
+        window.getSelection()?.addRange(range)
+      })
+      await touch.hold(row)
+      expect(await page.evaluate(() => window.getSelection()?.toString())).toBe('')
+      const lifted = page.locator('[class*="actionSheetLift"]')
+      await expect(lifted).toBeVisible()
+      expect(await unselectable(lifted)).toBe(true)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  /** The sort mode's parts: the top bar, its 完成, a row's handle and the ids in a container. */
+  const sortMode = (page: Page) => {
+    const bar = page.locator('header').first()
+    const list = page.getByRole('complementary', { name: '频道', exact: true })
+    const rowOf = (name: string) =>
+      list.locator('[data-row-key^="channel:"]').filter({ has: page.getByText(name, { exact: true }) })
+    return {
+      bar,
+      list,
+      done: bar.getByRole('button', { name: '完成' }),
+      rowOf,
+      handle: (name: string) => list.getByRole('button', { name: `调整「${name}」的位置` }),
+      groupHandle: (name: string) => list.getByRole('button', { name: `调整「${name}」分组的位置` }),
+      /** Channel ids of the rows inside `scope`, in order. */
+      ids: (scope: Locator) =>
+        scope
+          .locator('[data-row-key^="channel:"]')
+          .evaluateAll((rows) => rows.map((row) => row.getAttribute('data-row-key')?.slice('channel:'.length))),
+      groups: () =>
+        list
+          .locator('[data-row-key^="agent:"] [class*="groupName"]')
+          .evaluateAll((nodes) => nodes.map((node) => node.textContent)),
+    }
+  }
+
+  test('on a phone 排序 opens sort mode, where a handle carries a row past several in one move and saves once', async () => {
+    let arrangement: Awaited<ReturnType<typeof serveArrangement>> | undefined
+    const { page, errors } = await open('/channels', {
+      width: 393,
+      touch: true,
+      snapshot: crowdedSnapshot,
+      before: async (target) => {
+        arrangement = await serveArrangement(target, emptyView, crowdedSnapshot)
+      },
+    })
+    try {
+      const sort = sortMode(page)
+      const touch = await finger(page)
+      // Scrolled a little, so the list has room to keep the held row in place once the search row goes.
+      const held = sort.list.locator('a[href^="/channels/"]', { hasText: /^示例群 2(?!\d)/u })
+      await expect(held).toBeVisible()
+      await sort.list.locator('[class*="listBody"]').evaluate((node) => (node.scrollTop = 120))
+      await touch.hold(held)
+      await expect(touch.sheet.getByRole('button')).toHaveText(['置顶', '排序', '接到智能体…'])
+      const before = await held.boundingBox()
+      await touch.sheet.getByRole('button', { name: '排序' }).click()
+
+      // The top bar is the mode's own: its title and 完成, no way back, menu, search or bell; the list has no search
+      // or filter.
+      await expect(sort.done).toBeVisible()
+      await expect(sort.bar).toContainText('排序')
+      await expect(sort.bar.getByRole('button')).toHaveText(['完成'])
+      await expect(sort.bar.getByRole('link')).toHaveCount(0)
+      const title = await sort.bar.getByText('排序', { exact: true }).boundingBox()
+      expect(title?.x ?? 0).toBeCloseTo(16, 0)
+      await expect(sort.list.getByRole('searchbox')).toHaveCount(0)
+      await expect(sort.list.getByRole('combobox')).toHaveCount(0)
+      // The row stays where it was on screen.
+      const after = await sort.rowOf('示例群 2').first().boundingBox()
+      expect(Math.abs((after?.y ?? 0) - (before?.y ?? 0))).toBeLessThan(4)
+      // Every row has a fingertip-sized handle, and the rows are no longer links.
+      const handle = await sort.handle('示例群 1').boundingBox()
+      expect(handle?.width ?? 0).toBeGreaterThanOrEqual(44)
+      expect(handle?.height ?? 0).toBeGreaterThanOrEqual(44)
+      await expect(sort.list.locator('a[href^="/channels/"]')).toHaveCount(0)
+      await sort.rowOf('示例群 2').first().locator('[class*="rowName"]').tap()
+      await page.waitForTimeout(200)
+      await expect(page).toHaveURL(/\/channels$/u)
+      await expect(sort.done).toBeVisible()
+
+      // One move carries 示例群 1 three rows down; the rows between make room, and the order saves once.
+      const unbound = sort.list.getByRole('group', { name: '未接线' })
+      const [one, two, three, four] = ['chn_crowd00', 'chn_crowd01', 'chn_crowd02', 'chn_crowd03']
+      expect((await sort.ids(unbound)).slice(0, 5)).toEqual([externalChannelId, one, two, three, four])
+      const rowHeight = (await sort.rowOf('示例群 1').boundingBox())?.height ?? 60
+      await touch.drag(sort.handle('示例群 1'), rowHeight * 3, async () => {
+        const lifted = page.locator('[class*="sortLifted"]')
+        await expect(lifted).toBeVisible()
+        await expect(lifted).toContainText('示例群 1')
+        expect(await unselectable(lifted)).toBe(true)
+      })
+      await expect
+        .poll(async () => (await sort.ids(unbound)).slice(0, 5))
+        .toEqual([externalChannelId, two, three, four, one])
+      await expect.poll(() => arrangement?.orders.length).toBe(1)
+      expect(arrangement?.orders[0]?.unboundChannelIds.slice(0, 5)).toEqual([externalChannelId, two, three, four, one])
+
+      const scrolled = () =>
+        sort.list.evaluate((node) => Math.max(...[node, ...node.querySelectorAll('*')].map((item) => item.scrollTop)))
+
+      // Held at the list's lower edge, a row carries the list along under it.
+      const pane = await sort.list.boundingBox()
+      const grip = await sort.handle('示例群 8').boundingBox()
+      if (!pane || !grip) throw new Error('The list or the handle has no box.')
+      const resting = await scrolled()
+      await touch.drag(sort.handle('示例群 8'), pane.y + pane.height - 40 - (grip.y + grip.height / 2), async () => {
+        await expect.poll(scrolled).toBeGreaterThan(resting + 80)
+      })
+      await expect.poll(() => arrangement?.orders.length).toBe(2)
+
+      // A finger on a row's body, not its handle, scrolls the list and moves nothing.
+      await sort.list.locator('[class*="listBody"]').evaluate((node) => (node.scrollTop = 0))
+      await expect.poll(scrolled).toBe(0)
+      await touch.swipe(sort.rowOf('示例群 6').locator('[class*="rowName"]'), 200)
+      await expect.poll(scrolled).toBeGreaterThan(40)
+      await page.waitForTimeout(300)
+      expect(arrangement?.orders).toHaveLength(2)
+
+      // 完成 ends the mode: the list is back as it was, with its search.
+      await sort.done.click()
+      await expect(sort.list.getByRole('searchbox', { name: '搜索频道' })).toBeVisible()
+      await expect(sort.bar.getByRole('button', { name: '完成' })).toHaveCount(0)
+      await expect(sort.list.locator(`a[href="/channels/${one}"]`)).toBeVisible()
+      await expect(page).toHaveURL(/\/channels$/u)
+      expect(arrangement?.writes).toEqual([])
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone sort mode orders pins and groups, keeps every row in its own container, and back leaves it', async () => {
+    let arrangement: Awaited<ReturnType<typeof serveArrangement>> | undefined
+    const pins: ListView = { pinnedChannelIds: [sourceChannelId, externalChannelId], collapsedGroupIds: [] }
+    const { page, errors } = await open('/channels', {
+      width: 393,
+      touch: true,
+      snapshot: crowdedSnapshot,
+      before: async (target) => {
+        arrangement = await serveArrangement(target, pins, crowdedSnapshot)
+      },
+    })
+    try {
+      const sort = sortMode(page)
+      const touch = await finger(page)
+      // A held group head offers sort mode too.
+      await expect(sort.list.getByRole('group', { name: '置顶' })).toBeVisible()
+      const before = await sort.groups()
+      expect(before).toHaveLength(2)
+      await touch.hold(sort.list.locator('button[class*="groupHead"]', { hasText: before[0] ?? '' }))
+      await expect(touch.sheet).toHaveAccessibleName(before[0] ?? '')
+      await expect(touch.sheet.getByRole('button')).toHaveText(['排序'])
+      await touch.sheet.getByRole('button', { name: '排序' }).click()
+      await expect(sort.done).toBeVisible()
+
+      // Pins sort among themselves.
+      const pinned = sort.list.getByRole('group', { name: '置顶' })
+      expect(await sort.ids(pinned)).toEqual([sourceChannelId, externalChannelId])
+      const pinHeight = (await sort.rowOf('产品讨论群').first().boundingBox())?.height ?? 60
+      await touch.drag(sort.handle('产品讨论群').first(), -pinHeight)
+      await expect.poll(() => sort.ids(pinned)).toEqual([externalChannelId, sourceChannelId])
+      await expect
+        .poll(() => arrangement?.saved.at(-1))
+        .toEqual({ pinnedChannelIds: [externalChannelId, sourceChannelId], collapsedGroupIds: [] })
+
+      // Groups move by the handle on their head.
+      await touch.drag(sort.groupHandle(before[1] ?? ''), -200)
+      await expect.poll(sort.groups).toEqual([before[1], before[0]])
+      await expect
+        .poll(() => arrangement?.orders.at(-1)?.agentIds)
+        .toEqual(
+          [...before].reverse().map((name) => crowdedSnapshot.agents.find((agent) => agent.displayName === name)?.id),
+        )
+
+      // Dragged far past its own group, a row stays inside it: no binding changes, nothing asks to confirm.
+      const orders = arrangement?.orders.length ?? 0
+      const saves = arrangement?.saved.length ?? 0
+      await touch.drag(sort.handle('资料员的内置频道'), 400)
+      await page.waitForTimeout(400)
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+      expect(arrangement?.orders).toHaveLength(orders)
+      expect(arrangement?.saved).toHaveLength(saves)
+      expect(arrangement?.orders.at(-1)?.unboundChannelIds).not.toContain(targetChannelId)
+      await expect(sort.list.getByRole('group', { name: '未接线' }).getByText('资料员的内置频道')).toHaveCount(0)
+      expect(arrangement?.writes).toEqual([])
+
+      // The system's back step leaves the mode, onto the list as it was.
+      await page.goBack()
+      await expect(sort.done).toHaveCount(0)
+      await expect(sort.list.getByRole('searchbox', { name: '搜索频道' })).toBeVisible()
+      await expect(page).toHaveURL(/\/channels$/u)
+
+      // Sort mode is a step inside the tab: the bottom bar leaves it behind without keeping it in the history.
+      const listed = await place(page)
+      await touch.hold(sort.list.locator('button[class*="groupHead"]', { hasText: before[0] ?? '' }))
+      await touch.sheet.getByRole('button', { name: '排序' }).click()
+      await expect(sort.done).toBeVisible()
+      await tap(page, '智能体')
+      await expect(page).toHaveURL(/\/agents$/u)
+      expect((await place(page)).index).toBe(listed.index)
+      await tap(page, '频道')
+      await expect(page).toHaveURL(/\/channels$/u)
+      await expect(sort.done).toHaveCount(0)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone the actions sheet gives a channel to another agent or unbinds it through the confirmation', async () => {
+    const { page, errors } = await open('/channels', { width: 393, touch: true })
+    try {
+      const list = page.getByRole('complementary', { name: '频道', exact: true })
+      const touch = await finger(page)
+      const row = list.locator(`a[href="/channels/${sourceChannelId}"]`)
+      await touch.hold(row)
+      await expect(touch.sheet.getByRole('button')).toHaveText(['置顶', '排序', '移到其他智能体…', '解除接线'])
+      await touch.sheet.getByRole('button', { name: '移到其他智能体…' }).click()
+      // The same panel lists the other agents, with a way back.
+      await expect(touch.sheet).toHaveAccessibleName('移到其他智能体')
+      await expect(touch.sheet.getByRole('button', { name: '资料员' })).toBeVisible()
+      await expect(touch.sheet.getByRole('button', { name: '记录员' })).toHaveCount(0)
+      await touch.sheet.getByRole('button', { name: '返回' }).click()
+      await expect(touch.sheet).toHaveAccessibleName('记录员的内置频道')
+      await touch.sheet.getByRole('button', { name: '移到其他智能体…' }).click()
+      await touch.sheet.getByRole('button', { name: '资料员' }).click()
+      const rebind = page.getByRole('dialog', { name: '让资料员响应「记录员的内置频道」' })
+      await expect(rebind).toBeVisible()
+      await rebind.getByRole('button', { name: '取消' }).click()
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+
+      // The button only screen readers see opens the same sheet.
+      await list.getByRole('button', { name: '记录员的内置频道 的更多操作' }).focus()
+      await page.keyboard.press('Enter')
+      await expect(touch.sheet).toHaveAccessibleName('记录员的内置频道')
+      await touch.sheet.getByRole('button', { name: '解除接线' }).click()
+      const unbind = page.getByRole('dialog', { name: '断开「记录员的内置频道」与记录员？' })
+      await expect(unbind).toBeVisible()
+      await unbind.getByRole('button', { name: '取消' }).click()
+      await expect(page).toHaveURL(/\/channels$/u)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone the actions sheet pins and unpins, also from search results', async () => {
+    let arrangement: Awaited<ReturnType<typeof serveArrangement>> | undefined
+    const { page, errors } = await open('/channels', {
+      width: 393,
+      touch: true,
+      before: async (target) => {
+        arrangement = await serveArrangement(target)
+      },
+    })
+    try {
+      const list = page.getByRole('complementary', { name: '频道', exact: true })
+      const pinned = list.getByRole('group', { name: '置顶' })
+      const touch = await finger(page)
+      const row = (scope: Locator, id: string) => scope.locator(`a[href="/channels/${id}"]`)
+
+      await touch.hold(row(list, sourceChannelId))
+      await touch.sheet.getByRole('button', { name: '置顶', exact: true }).click()
+      await expect(row(pinned, sourceChannelId)).toBeVisible()
+
+      // A search result offers the same, for whatever applies to it there.
+      const search = list.getByRole('searchbox', { name: '搜索频道' })
+      await search.fill('产品')
+      await touch.hold(row(list, externalChannelId))
+      await expect(touch.sheet.getByRole('button')).toHaveText(['置顶', '接到智能体…'])
+      await touch.sheet.getByRole('button', { name: '置顶', exact: true }).click()
+      await search.fill('')
+      await expect.poll(() => rowIds(pinned)).toEqual([sourceChannelId, externalChannelId])
+
+      // A pinned row unpins, and sorts with the other pins.
+      await touch.hold(row(pinned, externalChannelId))
+      await expect(touch.sheet.getByRole('button')).toHaveText(['取消置顶', '排序', '接到智能体…'])
+      await page.keyboard.press('Escape')
+
+      await touch.hold(row(pinned, sourceChannelId))
+      await touch.sheet.getByRole('button', { name: '取消置顶' }).click()
+      await touch.hold(row(pinned, externalChannelId))
+      await touch.sheet.getByRole('button', { name: '取消置顶' }).click()
+      await expect(pinned).toHaveCount(0)
+      await expect.poll(() => arrangement?.saved.at(-1)).toEqual(emptyView)
+      await expect(page).toHaveURL(/\/channels$/u)
+      expect(arrangement?.writes).toEqual([])
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone a second tap on an open select closes it and it stays closed', async () => {
+    const { page } = await open('/settings/appearance', { width: 393, touch: true })
+    try {
+      const select = page.getByRole('combobox', { name: '设置分节' })
+      await expect(select).toBeVisible()
+      const box = await select.boundingBox()
+      if (!box) throw new Error('The section select has no box.')
+      const at = { x: box.x + box.width / 2, y: box.y + box.height / 2 }
+      await page.touchscreen.tap(at.x, at.y)
+      const list = page.getByRole('listbox')
+      await expect(list).toBeVisible()
+      await page.waitForTimeout(500)
+      await page.touchscreen.tap(at.x, at.y)
+      await expect(list).toBeHidden()
+      await page.waitForTimeout(500)
+      await expect(list).toBeHidden()
+      // A later tap opens it again.
+      await page.touchscreen.tap(at.x, at.y)
+      await expect(list).toBeVisible()
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone a conversation opened by its address goes back to the channel list in place', async () => {
+    const { page, errors } = await open('/live', { width: 393, touch: true })
+    try {
+      await expect(page.getByRole('navigation', { name: '主导航' })).toBeVisible()
+      // Like a notification: the conversation is the next entry, with no list in between.
+      await page.evaluate((path) => {
+        const state: unknown = history.state
+        const index = typeof state === 'object' && state !== null && 'idx' in state ? Number(state.idx) : 0
+        history.pushState({ usr: null, key: 'fromlink', idx: index + 1 }, '', path)
+        dispatchEvent(new PopStateEvent('popstate'))
+      }, `/channels/${externalChannelId}`)
+      await expect(page.getByRole('textbox', { name: '消息' })).toBeVisible()
+      const length = await page.evaluate(() => history.length)
+      await topBar(page).back('返回频道列表').click()
+      await expect(page).toHaveURL(/\/channels$/u)
+      await expect(page.getByRole('complementary', { name: '频道', exact: true })).toBeVisible()
+      // The list took the conversation's place: nothing was added, and back from the list leaves the channels.
+      expect(await page.evaluate(() => history.length)).toBe(length)
+      await page.goBack()
+      await expect(page).toHaveURL(/\/live$/u)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone the agent list is a page of its own and an agent the level above it', async () => {
+    const { page, errors } = await open('/agents', { width: 393, touch: true })
+    try {
+      const { bar, back } = topBar(page)
+      const nav = page.getByRole('navigation', { name: '主导航' })
+      const list = page.getByRole('complementary', { name: '智能体', exact: true })
+      await expect(list.getByRole('link', { name: /资料员/u })).toBeVisible()
+      await page.waitForTimeout(300)
+      await expect(page).toHaveURL(/\/agents$/u)
+      await expect(bar).toContainText('智能体')
+      await expect(page.getByRole('button', { name: '全部智能体' })).toBeHidden()
+      await list.getByRole('link', { name: /资料员/u }).click()
+      await expect(page).toHaveURL(new RegExp(`/agents/${targetAgentId}$`, 'u'))
+      await expect(bar).toContainText('资料员')
+      // Other second-level pages keep the bottom bar, with the agents space still selected.
+      await expect(nav).toBeVisible()
+      await expect(nav.getByRole('link', { name: '智能体', exact: true })).toHaveAttribute('aria-current', 'page')
+      await expect(page.getByRole('heading', { level: 1 })).toHaveCount(1)
+      await back('返回智能体列表').click()
+      await expect(page).toHaveURL(/\/agents$/u)
+      await expect(list.getByRole('link', { name: /资料员/u })).toBeVisible()
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone a first-level page names its space in the top bar and does not draw the title twice', async () => {
+    const { page } = await open('/live', { width: 393, touch: true })
+    try {
+      const { bar } = topBar(page)
+      await expect(bar).toContainText('概览')
+      await expect(bar).not.toContainText('NekroNXT')
+      await expect(bar.getByRole('button', { name: '搜索' })).toBeVisible()
+      const heading = page.getByRole('heading', { level: 1, name: '概览' })
+      await expect(heading).toHaveCount(1)
+      // Read out, not drawn: clipped to nothing.
+      expect(await heading.evaluate((node) => node.getBoundingClientRect().width)).toBeLessThanOrEqual(1)
+    } finally {
+      await page.close()
+    }
+  })
+
+  /** The phone's side menu: the top bar's button that opens it, the panel, its entries and the dim behind it. */
+  const sideMenu = (page: Page) => {
+    const button = page.getByRole('banner').getByRole('button', { name: '菜单' })
+    const panel = page.getByRole('dialog', { name: '菜单' })
+    return {
+      button,
+      panel,
+      item: (name: string) => panel.getByRole('link', { name, exact: true }),
+      open: async () => {
+        // A panel just closed still dims the page as it leaves and would take the tap.
+        await expect(page.getByRole('dialog')).toHaveCount(0)
+        await button.click()
+        await expect(panel).toBeVisible()
+      },
+    }
+  }
+
+  /** A finger on `from` moving left by `distance` over `steps` frames, then lifting. */
+  const swipeLeft = async (page: Page, from: { x: number; y: number }, distance: number, steps = 12) => {
+    const session = await page.context().newCDPSession(page)
+    const send = (type: 'touchStart' | 'touchMove' | 'touchEnd', point?: { x: number; y: number }) =>
+      session.send('Input.dispatchTouchEvent', { type, touchPoints: point ? [point] : [] })
+    await send('touchStart', from)
+    for (let step = 1; step <= steps; step++) {
+      await send('touchMove', { x: from.x - (step * distance) / steps, y: from.y })
+      await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => done(null))))
+    }
+    await send('touchEnd')
+  }
+
+  /** `productSnapshot` with an extension page that registered a navigation entry. */
+  const extensionPageSnapshot: Snapshot = HostApiContracts.snapshot.response.parse({
+    ...productSnapshot,
+    hostUi: {
+      preferencesRevision: 1,
+      pages: [
+        {
+          pageInstanceId: 'hup_samplepage',
+          owner: {
+            kind: 'extension',
+            extensionId: ExtensionIdSchema.parse('ext_samplepage'),
+            revisionId: ExtensionRevisionIdSchema.parse('xrv_samplepage'),
+          },
+          entryId: 'sample',
+          title: '示例看板',
+          icon: { kind: 'host-icon', name: 'puzzle' },
+          objectPane: 'hidden',
+          startPath: '',
+          visible: true,
+          sortOrder: 0,
+          rail: { order: 0 },
+          routeBase: '/apps/hup_samplepage',
+          client: { moduleUrl: '/host-ui/sample.mjs', buildKey: 'a'.repeat(64) },
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+    },
+  })
+
+  test('on a phone first-level pages lead the top bar with the menu, opened pages with the way back', async () => {
+    const { page, errors } = await open('/agents', { width: 393, touch: true })
+    try {
+      const menu = sideMenu(page)
+      const { back } = topBar(page)
+      await expect(menu.button).toBeVisible()
+      const box = await menu.button.boundingBox()
+      expect(box?.width ?? 0).toBeGreaterThanOrEqual(44)
+      expect(box?.height ?? 0).toBeGreaterThanOrEqual(44)
+      // It leads the bar, before the space's name.
+      expect(box?.x ?? 99).toBeLessThan(8)
+      await page
+        .getByRole('complementary', { name: '智能体', exact: true })
+        .getByRole('link', { name: /资料员/u })
+        .click()
+      await expect(back('返回智能体列表')).toBeVisible()
+      await expect(menu.button).toHaveCount(0)
+      await back('返回智能体列表').click()
+      await expect(menu.button).toBeVisible()
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone the menu lists every page, marks the current one and switches without adding history', async () => {
+    const { page, errors } = await open('/live', { width: 393, touch: true, snapshot: extensionPageSnapshot })
+    try {
+      const menu = sideMenu(page)
+      const start = await place(page)
+      await menu.open()
+      await expect(menu.panel.getByRole('link')).toHaveText([
+        '概览',
+        '频道',
+        '智能体',
+        '工坊',
+        '社区',
+        '接线',
+        '示例看板',
+        '日志',
+        '设置',
+      ])
+      await expect(menu.panel.getByText('扩展页面', { exact: true })).toBeVisible()
+      await expect(menu.panel.locator('[aria-current="page"]')).toHaveText(['概览'])
+      // Focus goes into the panel, onto the page it shows.
+      await expect(menu.item('概览')).toBeFocused()
+      // Full height from the left edge, four fifths of the screen wide.
+      await expect
+        .poll(async () => {
+          const box = await page.locator('[role="dialog"][data-state="open"]').boundingBox()
+          return box && [Math.round(box.x), Math.round(box.y), Math.round(box.width), Math.round(box.height)]
+        })
+        .toEqual([0, 0, 314, 852])
+      // The page behind does not scroll while it is open.
+      await expect(page.locator('body')).toHaveAttribute('data-scroll-locked', /\d/u)
+
+      await menu.item('接线').click()
+      await expect(menu.panel).toBeHidden()
+      await expect(page).toHaveURL(/\/wiring/u)
+      expect(await place(page)).toEqual(start)
+      await expect(menu.button).toBeFocused()
+      await menu.open()
+      await expect(menu.panel.locator('[aria-current="page"]')).toHaveText(['接线'])
+      await menu.item('示例看板').click()
+      await expect(page).toHaveURL(/\/apps\/hup_samplepage/u)
+      expect(await place(page)).toEqual(start)
+      await menu.open()
+      await expect(menu.panel.locator('[aria-current="page"]')).toHaveText(['示例看板'])
+      // The page it already shows only closes the menu.
+      await menu.item('示例看板').click()
+      await expect(menu.panel).toBeHidden()
+      expect(await place(page)).toEqual(start)
+      // Nothing of the app's lies behind: back leaves it, as from any first level.
+      await page.goBack()
+      await expect(page).toHaveURL('about:blank')
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone the menu closes from the dim, a swipe to the left and Escape, and focus returns to its button', async () => {
+    const { page, errors } = await open('/live', { width: 393, touch: true })
+    try {
+      const menu = sideMenu(page)
+      const panelBox = () => page.locator('[role="dialog"][data-state="open"]').boundingBox()
+
+      await menu.open()
+      await page.touchscreen.tap(370, 400)
+      await expect(menu.panel).toBeHidden()
+      await expect(menu.button).toBeFocused()
+      await expect(page).toHaveURL(/\/live$/u)
+
+      await menu.open()
+      await page.keyboard.press('Escape')
+      await expect(menu.panel).toBeHidden()
+      await expect(menu.button).toBeFocused()
+
+      // A short swipe springs back; one past a third of the panel closes it, and its release chooses nothing.
+      await menu.open()
+      await expect.poll(async () => Math.round((await panelBox())?.x ?? -1)).toBe(0)
+      const row = await menu.item('频道').boundingBox()
+      if (!row) throw new Error('The menu has no 频道 row.')
+      await swipeLeft(page, { x: row.x + 120, y: row.y + row.height / 2 }, 40)
+      await expect(menu.panel).toBeVisible()
+      await expect.poll(async () => Math.round((await panelBox())?.x ?? -1)).toBe(0)
+      await swipeLeft(page, { x: row.x + 120, y: row.y + row.height / 2 }, 160)
+      await expect(menu.panel).toBeHidden()
+      await expect(page).toHaveURL(/\/live$/u)
+      await expect(menu.button).toBeFocused()
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('computers show neither the menu button nor the side menu', async () => {
+    for (const width of [1440, 900]) {
+      const { page, errors } = await open('/live', { width })
+      try {
+        const nav = page.getByRole('navigation', { name: '主导航' })
+        await expect(nav.getByRole('link', { name: '概览', exact: true })).toHaveAttribute('aria-current', 'page')
+        await expect(page.getByRole('button', { name: '菜单' })).toHaveCount(0)
+        await expect(page.getByRole('dialog')).toHaveCount(0)
+        // The rail keeps every space, 日志 and 设置.
+        for (const name of ['社区', '接线', '日志', '设置'])
+          await expect(nav.getByRole('link', { name, exact: true })).toBeVisible()
+        expect(errors).toEqual([])
+      } finally {
+        await page.close()
+      }
+    }
+  })
+
+  /** The router's index of the entry on screen and how many entries the tab's history holds. */
+  const place = (page: Page) =>
+    page.evaluate(() => {
+      const state: unknown = history.state
+      return {
+        index: typeof state === 'object' && state !== null && 'idx' in state ? Number(state.idx) : -1,
+        length: history.length,
+      }
+    })
+
+  /**
+   * From now on, notes each frame's selected tab, the workbench level it shows and any level transition, and counts
+   * the history steps that reach the page's own listeners.
+   */
+  const watchFrames = (page: Page) =>
+    page.evaluate(() => {
+      const probe = { frames: [] as string[], pops: 0 }
+      Object.assign(window, { framesForTest: probe })
+      addEventListener('popstate', () => (probe.pops += 1))
+      const sample = () => {
+        const tab = document.querySelector('nav[aria-label="主导航"] [aria-current="page"]')?.textContent ?? '-'
+        const bench = document.querySelector<HTMLElement>('[data-layout="workbench"]')
+        probe.frames.push(
+          `${tab} ${bench?.dataset['phonePane'] ?? '-'} ${bench?.dataset['phoneMotion'] ?? '-'} ${location.pathname}`,
+        )
+        requestAnimationFrame(sample)
+      }
+      requestAnimationFrame(sample)
+    })
+  const watched = (page: Page) =>
+    page.evaluate(() => {
+      const probe = (window as Window & { framesForTest?: { frames: string[]; pops: number } }).framesForTest
+      return { frames: [...new Set(probe?.frames ?? [])], pops: probe?.pops ?? 0 }
+    })
+
+  const tap = async (page: Page, name: string) => {
+    const point = await bottomBar(page).center(name)
+    await page.touchscreen.tap(point.x, point.y)
+  }
+
+  test('on a phone the bottom bar switches between tabs without adding history', async () => {
+    const { page, errors } = await open('/live', { width: 393, touch: true })
+    try {
+      const bar = bottomBar(page)
+      await expect(bar.item('概览')).toHaveAttribute('aria-current', 'page')
+      const start = await place(page)
+      for (const [name, path] of [
+        ['频道', /\/channels$/u],
+        ['智能体', /\/agents$/u],
+        ['工坊', /\/workshop$/u],
+      ] as const) {
+        await tap(page, name)
+        await expect(page).toHaveURL(path)
+        await expect(bar.item(name)).toHaveAttribute('aria-current', 'page')
+      }
+      expect(await place(page)).toEqual(start)
+      // Nothing of the app's lies behind the first level: back leaves the app instead of returning to a tab.
+      await page.goBack()
+      await expect(page).toHaveURL('about:blank')
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone a tab switch from an opened agent steps back past it without showing the list', async () => {
+    const { page, errors } = await open('/agents', { width: 393, touch: true })
+    try {
+      const bar = bottomBar(page)
+      const list = page.getByRole('complementary', { name: '智能体', exact: true })
+      await list.getByRole('link', { name: /资料员/u }).click()
+      await expect(page).toHaveURL(new RegExp(`/agents/${targetAgentId}$`, 'u'))
+      // Past the push transition and its fallback timer, so the frames below only see the switch.
+      await page.waitForTimeout(700)
+      await expect(page.locator('[data-layout="workbench"]')).not.toHaveAttribute('data-phone-motion')
+      const opened = await place(page)
+      expect(opened.index).toBe(1)
+      await watchFrames(page)
+      await tap(page, '频道')
+      await expect(page).toHaveURL(/\/channels$/u)
+      await expect(bar.item('频道')).toHaveAttribute('aria-current', 'page')
+      await expect(page.getByRole('complementary', { name: '频道', exact: true })).toBeVisible()
+      await page.waitForTimeout(200)
+      // The channel list took the agent list's entry; the agent stays only as a forward step.
+      expect(await place(page)).toEqual({ index: 0, length: opened.length })
+      const { frames, pops } = await watched(page)
+      // Every frame shows the agent or the channel list, never the agent list in between, and no level slides.
+      expect(frames.filter((frame) => frame.startsWith('智能体 list'))).toEqual([])
+      expect(frames.filter((frame) => frame.split(' ')[2] !== '-')).toEqual([])
+      expect(frames.every((frame) => frame.startsWith('智能体 main - ') || frame.startsWith('频道 list - '))).toBe(true)
+      // The step back never reached the router.
+      expect(pops).toBe(0)
+      await page.goBack()
+      await expect(page).toHaveURL('about:blank')
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone a tab switch two pages deep into a tab still lands on one entry', async () => {
+    const { page, errors } = await open('/agents', { width: 393, touch: true })
+    try {
+      const list = page.getByRole('complementary', { name: '智能体', exact: true })
+      await list.getByRole('link', { name: /资料员/u }).click()
+      await expect(page).toHaveURL(new RegExp(`/agents/${targetAgentId}$`, 'u'))
+      // Another agent from the palette: a second page inside the same tab.
+      await page.keyboard.press('Control+k')
+      const palette = page.getByRole('dialog')
+      await palette.getByRole('combobox', { name: '搜索' }).fill('记录员')
+      await palette
+        .getByRole('option', { name: /记录员/u })
+        .filter({ hasNotText: '内置频道' })
+        .first()
+        .click()
+      await expect(page).toHaveURL(new RegExp(`/agents/${sourceAgentId}$`, 'u'))
+      await expect(page.getByRole('dialog')).toHaveCount(0)
+      expect((await place(page)).index).toBe(2)
+      // The palette's scrim fades out after the dialog has gone and would take the tap.
+      await expect(page.locator('[class*="scrim"]')).toHaveCount(0)
+      await watchFrames(page)
+      await tap(page, '工坊')
+      await expect(page).toHaveURL(/\/workshop$/u)
+      await expect(bottomBar(page).item('工坊')).toHaveAttribute('aria-current', 'page')
+      await page.waitForTimeout(200)
+      expect((await place(page)).index).toBe(0)
+      const { frames, pops } = await watched(page)
+      expect(frames.filter((frame) => frame.startsWith('智能体 list'))).toEqual([])
+      expect(pops).toBe(0)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone a drag along the bottom bar and the menu switch tabs in place as well', async () => {
+    const { page, errors } = await open('/agents', { width: 393, touch: true })
+    try {
+      const bar = bottomBar(page)
+      const list = page.getByRole('complementary', { name: '智能体', exact: true })
+      await list.getByRole('link', { name: /资料员/u }).click()
+      await expect(page).toHaveURL(new RegExp(`/agents/${targetAgentId}$`, 'u'))
+      await bar.drag('智能体', await bar.center('工坊'))
+      await page.mouse.up()
+      await expect(page).toHaveURL(/\/workshop$/u)
+      expect((await place(page)).index).toBe(0)
+
+      const menu = sideMenu(page)
+      await menu.open()
+      await menu.item('接线').click()
+      await expect(page).toHaveURL(/\/wiring/u)
+      await expect(bar.nav.locator('[aria-current="page"]')).toHaveCount(0)
+      expect((await place(page)).index).toBe(0)
+      await menu.open()
+      await menu.item('设置').click()
+      // 设置 redirects to its first section; that is still the tab's first level.
+      await expect(page).toHaveURL(/\/settings\/models$/u)
+      expect((await place(page)).index).toBe(0)
+      await tap(page, '概览')
+      await expect(page).toHaveURL(/\/live$/u)
+      expect((await place(page)).index).toBe(0)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone the selected tab takes an opened page back to its list', async () => {
+    const { page, errors } = await open('/agents', { width: 393, touch: true })
+    try {
+      const list = page.getByRole('complementary', { name: '智能体', exact: true })
+      await list.getByRole('link', { name: /资料员/u }).click()
+      await expect(page).toHaveURL(new RegExp(`/agents/${targetAgentId}$`, 'u'))
+      const opened = await place(page)
+      await tap(page, '智能体')
+      await expect(page).toHaveURL(/\/agents$/u)
+      await expect(list.getByRole('link', { name: /资料员/u })).toBeVisible()
+      // A step back, like the top bar's arrow: the agent is the next entry again, nothing was added.
+      expect(await place(page)).toEqual({ index: opened.index - 1, length: opened.length })
+      await page.goForward()
+      await expect(page).toHaveURL(new RegExp(`/agents/${targetAgentId}$`, 'u'))
+      await page.goBack()
+      // On the list itself it stays where it is.
+      await tap(page, '智能体')
+      await page.waitForTimeout(200)
+      await expect(page).toHaveURL(/\/agents$/u)
+      expect(await place(page)).toEqual({ index: opened.index - 1, length: opened.length })
+      // A tap that lands before the opened page is drawn still goes back instead of replacing the page.
+      await list.getByRole('link', { name: /资料员/u }).click()
+      await tap(page, '智能体')
+      await expect(page).toHaveURL(/\/agents$/u)
+      await page.waitForTimeout(200)
+      expect(await place(page)).toEqual({ index: opened.index - 1, length: opened.length })
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('on a phone an agent opened by its address switches tabs in place', async () => {
+    for (const [name, path] of [
+      ['频道', /\/channels$/u],
+      ['智能体', /\/agents$/u],
+    ] as const) {
+      const { page, errors } = await open(`/agents/${targetAgentId}`, { width: 393, touch: true })
+      try {
+        await expect(topBar(page).back('返回智能体列表')).toBeVisible()
+        const start = await place(page)
+        await tap(page, name)
+        await expect(page).toHaveURL(path)
+        expect(await place(page)).toEqual(start)
+        expect(errors).toEqual([])
+      } finally {
+        await page.close()
+      }
+    }
+  })
+
+  test('on a phone a link into another tab is a step that back returns from', async () => {
+    const { page, errors } = await open('/agents', { width: 393, touch: true })
+    try {
+      const list = page.getByRole('complementary', { name: '智能体', exact: true })
+      await list.getByRole('link', { name: /资料员/u }).click()
+      await expect(page).toHaveURL(new RegExp(`/agents/${targetAgentId}$`, 'u'))
+      await page.getByRole('button', { name: '在频道中对话' }).click()
+      await expect(page).toHaveURL(new RegExp(`/channels/${targetChannelId}$`, 'u'))
+      expect((await place(page)).index).toBe(2)
+      await page.goBack()
+      await expect(page).toHaveURL(new RegExp(`/agents/${targetAgentId}$`, 'u'))
+      await page.getByRole('button', { name: '查看日志' }).click()
+      await expect(page).toHaveURL(/\/logs/u)
+      expect((await place(page)).index).toBe(2)
+      await page.goBack()
+      await expect(page).toHaveURL(new RegExp(`/agents/${targetAgentId}$`, 'u'))
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('computers keep each rail switch as a history step', async () => {
+    const { page, errors } = await open('/live')
+    try {
+      const nav = page.getByRole('navigation', { name: '主导航' })
+      await expect(nav.getByRole('link', { name: '概览', exact: true })).toHaveAttribute('aria-current', 'page')
+      await nav.getByRole('link', { name: '工坊', exact: true }).click()
+      await expect(page).toHaveURL(/\/workshop/u)
+      await nav.getByRole('link', { name: '接线', exact: true }).click()
+      await expect(page).toHaveURL(/\/wiring/u)
+      expect((await place(page)).index).toBe(2)
+      await page.goBack()
+      await expect(page).toHaveURL(/\/workshop/u)
+      await page.goBack()
+      await expect(page).toHaveURL(/\/live$/u)
+      expect(errors).toEqual([])
+    } finally {
+      await page.close()
+    }
+  })
+
+  test('computers keep the channel drawer, header and placeholder', async () => {
+    const { page, errors } = await open('/channels', { width: 900 })
+    try {
+      // The last channel opens by itself; the list is a drawer at this width.
+      await expect(page).toHaveURL(/\/channels\/chn_/u)
+      await expect(page.getByRole('button', { name: '全部频道' })).toBeVisible()
+      const heading = page.getByRole('heading', { level: 1 })
+      await expect(heading).toBeVisible()
+      expect((await heading.boundingBox())?.width ?? 0).toBeGreaterThan(40)
+      await expect(page.getByRole('main').getByRole('button', { name: /透视/u })).toBeVisible()
+      await expect(page.getByRole('textbox', { name: '消息' })).toHaveAttribute('placeholder', /，或输入 \/ 执行命令$/u)
+      await expect(page.getByRole('button', { name: '添加附件' })).toBeVisible()
+      await expect(page.getByRole('navigation', { name: '主导航' })).toBeVisible()
+      await expect(page.locator('header').first()).toContainText('NekroNXT')
       expect(errors).toEqual([])
     } finally {
       await page.close()

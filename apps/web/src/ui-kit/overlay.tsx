@@ -3,8 +3,17 @@ import * as RadixDialog from '@radix-ui/react-dialog'
 import * as RadixMenu from '@radix-ui/react-dropdown-menu'
 import * as RadixPopover from '@radix-ui/react-popover'
 import * as RadixTooltip from '@radix-ui/react-tooltip'
-import { Check, CircleHelp, TriangleAlert, X } from 'lucide-react'
-import { useLayoutEffect, useRef, useState, useSyncExternalStore, type KeyboardEvent, type ReactNode } from 'react'
+import { Check, ChevronLeft, ChevronRight, CircleHelp, TriangleAlert, X } from 'lucide-react'
+import {
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type KeyboardEvent,
+  type ReactNode,
+  type RefObject,
+} from 'react'
+import { usePhone } from './phone.js'
 import { Button, IconButton, Pressable } from './primitives.js'
 import styles from './overlay.module.css'
 
@@ -238,6 +247,355 @@ export function Sheet({
   )
 }
 
+/** How far a downward swipe must carry a bottom sheet before letting go closes it. */
+const SWIPE_CLOSE = 72
+
+/** Room kept between a raised item and the sheet below it. */
+const LIFT_GAP = 12
+
+/** The raised item stands in from the screen edges by this much, so its rounded corners and shadow show. */
+const LIFT_INSET = 6
+
+/** Reduced motion, chosen in the app or in the system. */
+const motionReduced = (): boolean =>
+  document.documentElement.dataset['nxtMotion'] === 'off' ||
+  (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false)
+
+/** A choice in an `ActionSheet`. `opensMore` keeps the sheet open: choosing it shows a further set of choices. */
+export interface ActionSheetEntry extends MenuEntry {
+  readonly opensMore?: boolean
+}
+
+/** The item a long press opened the sheet for, drawn raised above the dimmed page where it sat. */
+export interface ActionSheetLift {
+  readonly rect: { readonly top: number; readonly left: number; readonly width: number; readonly height: number }
+  readonly content: ReactNode
+}
+
+/**
+ * A short list of choices that rises from the bottom edge on a phone (05 §6.2), over a dimmed page. A tap on the
+ * page, Escape, or swiping the panel down closes it; choosing a row closes it and then runs the choice, still within
+ * the same tap (a file picker opened from it keeps the gesture it needs).
+ *
+ * A choice that `opensMore` swaps in another set of choices instead: the caller changes `page`, `title` and `items`,
+ * and `onBack` puts a back button before the title. The panel then eases to its new height while the new choices
+ * slide in. `lift` raises the pressed item over the dim, moved up when the panel would cover it.
+ */
+export function ActionSheet({
+  open,
+  onOpenChange,
+  title,
+  items,
+  page = '',
+  onBack,
+  lift,
+}: {
+  readonly open: boolean
+  readonly onOpenChange: (open: boolean) => void
+  readonly title: string
+  readonly items: readonly ActionSheetEntry[]
+  /** Names the set of choices shown; a change animates to the new set. */
+  readonly page?: string
+  readonly onBack?: () => void
+  readonly lift?: ActionSheetLift
+}) {
+  const returnFocus = useReturnFocus(open)
+  const panel = useRef<HTMLDivElement | null>(null)
+  const swipe = useRef<{ readonly id: number; readonly y: number; moved: boolean } | undefined>(undefined)
+  const shown = useRef({ open: false, page, height: 0 })
+  const back = useRef(false)
+  const [liftShift, setLiftShift] = useState(0)
+  // The set the sheet opened on rises with the panel; only a set swapped in afterwards slides in.
+  const openedOn = useRef(page)
+  const wasOpen = useRef(false)
+  if (open && !wasOpen.current) {
+    openedOn.current = page
+    back.current = false
+  }
+  wasOpen.current = open
+  const settle = (close: boolean) => {
+    const element = panel.current
+    swipe.current = undefined
+    if (!element) return
+    delete element.dataset['dragging']
+    if (close) onOpenChange(false)
+    else element.style.removeProperty('transform')
+  }
+  /** Moves the raised item up when the panel would cover it. */
+  const placeLift = (element: HTMLElement) => {
+    if (!lift) return
+    const below = lift.rect.top + lift.rect.height
+    const room = element.offsetTop - LIFT_GAP - below
+    setLiftShift(room < 0 ? Math.max(room, LIFT_GAP - lift.rect.top) : 0)
+  }
+  useLayoutEffect(() => {
+    const element = panel.current
+    const before = shown.current
+    // Layout height: the rising animation's transform does not change it.
+    const height = element?.offsetHeight ?? 0
+    shown.current = { open, page, height }
+    if (!element || !open) return
+    placeLift(element)
+    if (!before.open || before.page === page) return
+    // The new set of choices takes the place of the old: keep focus inside, on its first control.
+    element.querySelector<HTMLElement>('button:not(:disabled)')?.focus()
+    if (before.height && before.height !== height && !motionReduced()) {
+      element.animate([{ height: `${before.height}px` }, { height: `${height}px` }], {
+        duration: 280,
+        easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)',
+      })
+    }
+  })
+  return (
+    <RadixDialog.Root open={open} onOpenChange={onOpenChange}>
+      <RadixDialog.Portal>
+        <RadixDialog.Overlay className={styles.scrim} />
+        {lift ? (
+          <div
+            className={styles.actionSheetLift}
+            data-state={open ? 'open' : 'closed'}
+            aria-hidden="true"
+            style={{
+              top: lift.rect.top,
+              left: lift.rect.left + LIFT_INSET,
+              width: lift.rect.width - 2 * LIFT_INSET,
+              height: lift.rect.height,
+              ...cssVars({ '--lift-shift': `${liftShift}px` }),
+            }}
+          >
+            <div style={{ width: lift.rect.width, marginLeft: -LIFT_INSET }}>{lift.content}</div>
+          </div>
+        ) : null}
+        <RadixDialog.Content
+          // The panel mounts a moment after `open` (Radix portals mount in their own pass): place the item then.
+          ref={(element) => {
+            panel.current = element
+            if (element) placeLift(element)
+          }}
+          className={styles.actionSheet}
+          aria-describedby={undefined}
+          onCloseAutoFocus={returnFocus}
+          onPointerDown={(event) => {
+            if (event.pointerType === 'mouse' || !event.isPrimary) return
+            swipe.current = { id: event.pointerId, y: event.clientY, moved: false }
+          }}
+          onPointerMove={(event) => {
+            const active = swipe.current
+            const element = panel.current
+            if (!active || active.id !== event.pointerId || !element) return
+            const distance = Math.max(0, event.clientY - active.y)
+            if (!active.moved && distance < 6) return
+            active.moved = true
+            element.dataset['dragging'] = ''
+            element.style.transform = `translateY(${distance}px)`
+          }}
+          onPointerUp={(event) => {
+            const active = swipe.current
+            if (!active || active.id !== event.pointerId) return
+            settle(active.moved && event.clientY - active.y > SWIPE_CLOSE)
+          }}
+          onPointerCancel={() => settle(false)}
+          onClickCapture={(event) => {
+            // The release that ends a swipe is not a choice.
+            if (panel.current?.dataset['dragging'] !== undefined) event.stopPropagation()
+          }}
+        >
+          <span className={styles.actionSheetGrabber} aria-hidden="true" />
+          <div
+            key={page}
+            className={styles.actionSheetPage}
+            data-switched={page !== openedOn.current}
+            data-back={back.current}
+          >
+            <div className={styles.actionSheetHead} data-back-button={onBack !== undefined}>
+              {onBack ? (
+                <IconButton
+                  label="返回"
+                  onClick={() => {
+                    back.current = true
+                    onBack()
+                  }}
+                >
+                  <ChevronLeft size={18} />
+                </IconButton>
+              ) : null}
+              <RadixDialog.Title className={styles.actionSheetTitle}>{title}</RadixDialog.Title>
+            </div>
+            <div className={styles.actionSheetList}>
+              {items.map((item) => (
+                <Pressable
+                  key={item.key}
+                  className={[styles.actionSheetItem, item.danger ? styles.menuDanger : ''].join(' ')}
+                  disabled={item.disabled ?? false}
+                  {...(item.opensMore ? { 'aria-haspopup': 'true' as const } : {})}
+                  onClick={() => {
+                    if (item.opensMore) {
+                      back.current = false
+                      item.onSelect()
+                      return
+                    }
+                    onOpenChange(false)
+                    item.onSelect()
+                  }}
+                >
+                  {item.icon}
+                  <span className={styles.actionSheetLabel}>{item.label}</span>
+                  {item.opensMore ? <ChevronRight className={styles.actionSheetMore} aria-hidden="true" /> : null}
+                </Pressable>
+              ))}
+            </div>
+          </div>
+        </RadixDialog.Content>
+      </RadixDialog.Portal>
+    </RadixDialog.Root>
+  )
+}
+
+/** How far, as a share of its width, a leftward swipe must carry a side panel before letting go closes it. */
+const SIDE_SWIPE_CLOSE = 0.3
+
+/** A quicker flick than this (px/ms) closes the side panel whatever the distance. */
+const SIDE_FLICK = 0.5
+
+/**
+ * A full-height panel that slides in from the left edge on a phone (05 §6.2), over a dimmed page: the app's menu of
+ * every page. A tap on the dim, Escape, or swiping the panel to the left closes it. Focus lands on the entry marked
+ * `aria-current="page"` (or the first control) and goes back to `opener` when it closes; the page behind does not
+ * scroll while it is open. There is no edge swipe to pull it out: on iOS that is the system's back gesture.
+ */
+export function SidePanel({
+  open,
+  onOpenChange,
+  label,
+  opener,
+  className,
+  children,
+}: {
+  readonly open: boolean
+  readonly onOpenChange: (open: boolean) => void
+  readonly label: string
+  /** The control that opened the panel; touch browsers do not always focus it on a tap, so it is named here. */
+  readonly opener?: RefObject<HTMLElement | null>
+  readonly className?: string
+  readonly children: ReactNode
+}) {
+  const returnFocus = useReturnFocus(open)
+  const panel = useRef<HTMLDivElement | null>(null)
+  const scrim = useRef<HTMLDivElement | null>(null)
+  const swipe = useRef<
+    | {
+        readonly id: number
+        readonly x: number
+        readonly y: number
+        moved: boolean
+        last: number
+        at: number
+        speed: number
+      }
+    | undefined
+  >(undefined)
+  /** The last gesture was a swipe: the click a browser may still send for it is not a choice. */
+  const swiped = useRef(false)
+  const follow = (distance: number) => {
+    const element = panel.current
+    if (!element) return
+    element.style.transform = `translateX(${-distance}px)`
+    if (scrim.current) scrim.current.style.opacity = String(1 - distance / element.offsetWidth)
+  }
+  const settle = (close: boolean) => {
+    const element = panel.current
+    swipe.current = undefined
+    if (!element) return
+    delete element.dataset['dragging']
+    if (scrim.current) delete scrim.current.dataset['dragging']
+    // Closing leaves both where the finger let go, so the exit runs on from there.
+    if (close) return onOpenChange(false)
+    element.style.removeProperty('transform')
+    scrim.current?.style.removeProperty('opacity')
+  }
+  return (
+    <RadixDialog.Root open={open} onOpenChange={onOpenChange}>
+      <RadixDialog.Portal>
+        <RadixDialog.Overlay ref={scrim} className={[styles.scrim, styles.sidePanelScrim].join(' ')} />
+        <RadixDialog.Content
+          ref={panel}
+          className={[styles.sidePanel, className].filter(Boolean).join(' ')}
+          aria-describedby={undefined}
+          onOpenAutoFocus={(event) => {
+            const current = panel.current?.querySelector<HTMLElement>('[aria-current="page"]')
+            if (!current) return
+            event.preventDefault()
+            current.focus()
+          }}
+          onCloseAutoFocus={(event) => {
+            const target = opener?.current
+            // Reopened before the exit finished: `returnFocus` keeps focus inside.
+            if (!open && target?.isConnected) {
+              event.preventDefault()
+              target.focus()
+              return
+            }
+            returnFocus(event)
+          }}
+          onPointerDown={(event) => {
+            swiped.current = false
+            if (event.pointerType === 'mouse' || !event.isPrimary) return
+            swipe.current = {
+              id: event.pointerId,
+              x: event.clientX,
+              y: event.clientY,
+              moved: false,
+              last: event.clientX,
+              at: event.timeStamp,
+              speed: 0,
+            }
+          }}
+          onPointerMove={(event) => {
+            const active = swipe.current
+            const element = panel.current
+            if (!active || active.id !== event.pointerId || !element) return
+            const dx = event.clientX - active.x
+            if (!active.moved) {
+              // A vertical move scrolls the list; the browser takes it over (touch-action: pan-y).
+              if (Math.abs(event.clientY - active.y) > Math.abs(dx) || -dx < 6) return
+              active.moved = true
+              element.dataset['dragging'] = ''
+              if (scrim.current) scrim.current.dataset['dragging'] = ''
+            }
+            const elapsed = event.timeStamp - active.at
+            if (elapsed > 0) active.speed = (active.last - event.clientX) / elapsed
+            active.last = event.clientX
+            active.at = event.timeStamp
+            follow(Math.max(0, -dx))
+          }}
+          onPointerUp={(event) => {
+            const active = swipe.current
+            const element = panel.current
+            if (!active || active.id !== event.pointerId || !element) return
+            const distance = active.x - event.clientX
+            swiped.current = active.moved
+            settle(
+              active.moved &&
+                distance > 0 &&
+                (distance > element.offsetWidth * SIDE_SWIPE_CLOSE || active.speed > SIDE_FLICK),
+            )
+          }}
+          onPointerCancel={() => settle(false)}
+          onClickCapture={(event) => {
+            if (!swiped.current) return
+            swiped.current = false
+            event.preventDefault()
+            event.stopPropagation()
+          }}
+        >
+          <RadixDialog.Title className={styles.srOnly}>{label}</RadixDialog.Title>
+          {children}
+        </RadixDialog.Content>
+      </RadixDialog.Portal>
+    </RadixDialog.Root>
+  )
+}
+
 export interface MenuEntry {
   readonly key: string
   readonly label: ReactNode
@@ -246,14 +604,6 @@ export interface MenuEntry {
   readonly disabled?: boolean
   readonly onSelect: () => void
 }
-
-const PHONE = '(max-width: 760px)'
-const subscribePhone = (change: () => void) => {
-  const query = window.matchMedia?.(PHONE)
-  query?.addEventListener('change', change)
-  return () => query?.removeEventListener('change', change)
-}
-const readPhone = () => window.matchMedia?.(PHONE).matches ?? false
 
 export function Menu({
   trigger,
@@ -272,7 +622,7 @@ export function Menu({
   readonly onOpenChange?: (open: boolean) => void
 }) {
   // On a phone the menu dims the page behind it, so a tap outside only closes it instead of reaching what is there.
-  const phone = useSyncExternalStore(subscribePhone, readPhone, () => false)
+  const phone = usePhone()
   return (
     <RadixMenu.Root modal={phone} {...(open === undefined ? {} : { open })} {...(onOpenChange ? { onOpenChange } : {})}>
       <RadixMenu.Trigger asChild>{trigger}</RadixMenu.Trigger>

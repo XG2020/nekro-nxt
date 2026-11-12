@@ -339,8 +339,16 @@ const assertViewportIntegrity = async (page: Page): Promise<void> => {
   }))
   expect(geometry.documentWidth).toBeLessThanOrEqual(geometry.viewportWidth)
   expect(geometry.bodyWidth).toBeLessThanOrEqual(geometry.viewportWidth)
-  await expect(page.getByRole('navigation', { name: '主导航' })).toBeVisible()
-  await expect(page.getByRole('button', { name: '搜索', exact: true })).toBeVisible()
+  // On a phone a page opened from a list carries its way back in the top bar instead of search (and a conversation
+  // also sets the bottom bar aside, 05 §6.2); the list it returns to has both.
+  // One condition polled as a whole: while a detail page is still loading the bottom bar shows before the top bar
+  // swaps search for its way back, so deciding from a single moment picks the wrong branch.
+  const back = page.getByRole('banner').getByRole('button', { name: /^返回.+列表$/u })
+  const nav = page.getByRole('navigation', { name: '主导航' })
+  const search = page.getByRole('button', { name: '搜索', exact: true })
+  await expect
+    .poll(async () => (await back.isVisible()) || ((await nav.isVisible()) && (await search.isVisible())))
+    .toBe(true)
 }
 
 /** Masks for values that change with the wall clock. */
@@ -806,7 +814,7 @@ test('composer attachments upload, fail, retry, remove and send as ordered parts
     .setInputFiles([{ name: '截图.png', mimeType: 'image/png', buffer: png }])
   await page
     .locator('input[type="file"]')
-    .nth(1)
+    .first()
     .setInputFiles([{ name: '说明.txt', mimeType: 'text/plain', buffer: Buffer.from('虚构说明内容。') }])
   const list = page.getByRole('list', { name: '待发送附件' })
   await expect(list.getByRole('listitem', { name: '截图.png' })).toContainText('B')

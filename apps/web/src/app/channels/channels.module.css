@@ -35,8 +35,10 @@
   cursor: pointer;
 }
 
-.groupHead:hover {
-  background: var(--hover);
+@media (hover: hover) {
+  .groupHead:hover {
+    background: var(--hover);
+  }
 }
 
 /* A long agent name gives way before the state does: one line, cut with an ellipsis. */
@@ -169,16 +171,71 @@
   border-radius: 10px;
   color: var(--fg);
   text-decoration: none;
-  touch-action: none;
+  /* A finger scrolls the list and never drags; a held one opens the actions sheet (channel-list.tsx). */
+  touch-action: manipulation;
   transition: background var(--dur-1);
 }
 
-.row:hover {
-  background: var(--hover);
+@media (hover: hover) {
+  .row:hover {
+    background: var(--hover);
+  }
 }
 
 .row[data-selected='true']:hover {
   background: transparent;
+}
+
+.row:active {
+  background: var(--hover);
+  transition-duration: 0s;
+}
+
+/* A phone's channel list is a page of its own: rows run edge to edge with the page margin and a fingertip tall. */
+@media (max-width: 760px) {
+  .group {
+    margin-top: var(--s-1);
+    border-radius: 0;
+  }
+
+  .groupHeadRow {
+    padding: 0 var(--s-2) 0 0;
+  }
+
+  .groupHead {
+    min-height: 44px;
+    padding: var(--s-2) var(--s-4);
+    border-radius: 0;
+  }
+
+  .row {
+    align-content: center;
+    min-height: 60px;
+    padding: var(--s-2) var(--s-4);
+    border-radius: 0;
+  }
+
+  /* No more button is drawn on a phone (a long press opens the actions): time and unread run to the margin. */
+  .rowWrap > .row {
+    padding-right: var(--s-4);
+  }
+
+  .rowMenu {
+    right: var(--s-3);
+  }
+
+  .groupHeadRow {
+    position: relative;
+  }
+
+  /* Read out, and shown only while a keyboard is on it (channel-list.tsx `HiddenActions`). */
+  .hiddenActions:not(:focus-within) {
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
 }
 
 .rowDragging {
@@ -272,6 +329,123 @@
     transform: scale(2.8);
     opacity: 0;
   }
+}
+
+/*
+ * Nothing in the channel list is text to copy: a held finger opens the row's actions or drags it, so iOS must not
+ * start a selection, the magnifier or its copy menu. Children too, whatever their own styles say.
+ */
+.channelTree,
+.channelTree *,
+.sortLifted,
+.sortLifted *,
+.dragOverlay {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* —— 排序模式（手机） —— */
+.sortMode {
+  padding-top: var(--s-2);
+}
+
+/* A group head's handle lines up with the handles of the rows under it. */
+.sortMode .groupHeadRow,
+.groupHeadRow.sortLifted {
+  padding-right: 0;
+}
+
+.sortList {
+  position: relative;
+}
+
+.sortRow {
+  position: relative;
+  display: flex;
+  align-items: center;
+  background: var(--bg);
+}
+
+/* The row being moved leaves its gap; the raised copy follows the finger. */
+.sortRow[data-dragging] {
+  opacity: 0;
+}
+
+.group[data-dragging] {
+  opacity: 0;
+}
+
+.sortRowBody {
+  display: grid;
+  flex: 1;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: calc(var(--s-1) / 4) var(--s-2);
+  align-content: center;
+  min-width: 0;
+  min-height: 60px;
+  padding: var(--s-2) 0 var(--s-2) var(--s-4);
+  color: var(--fg);
+}
+
+/* Only the handle drags: a finger anywhere else on the row still scrolls the list. */
+.sortHandle {
+  display: grid;
+  flex: none;
+  width: 44px;
+  height: 44px;
+  margin-right: var(--s-2);
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--faint);
+  cursor: grab;
+  touch-action: none;
+}
+
+.sortHandle svg {
+  width: 20px;
+  height: 20px;
+}
+
+.sortHandle:active {
+  color: var(--fg-2);
+}
+
+.sortLifted {
+  border-radius: var(--r-2);
+  background: var(--surface);
+  box-shadow: var(--sh-3);
+  cursor: grabbing;
+  animation: sortLift var(--dur-1) var(--ease) both;
+}
+
+@keyframes sortLift {
+  from {
+    box-shadow: none;
+    transform: scale(1);
+  }
+
+  to {
+    transform: scale(1.02);
+  }
+}
+
+.sortDone {
+  height: 44px;
+  padding: 0 var(--s-3);
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+
+.sortDone:active {
+  background: var(--hover);
 }
 
 .dragOverlay {
@@ -411,9 +585,11 @@
   height: 16px;
 }
 
-.toggle:hover {
-  border-color: var(--line-3);
-  color: var(--fg);
+@media (hover: hover) {
+  .toggle:hover {
+    border-color: var(--line-3);
+    color: var(--fg);
+  }
 }
 
 .toggle[aria-pressed='true'] {
@@ -1238,9 +1414,11 @@ button.step:hover {
   background: transparent;
   cursor: pointer;
 }
-.attach:hover:not(:disabled) {
-  color: var(--fg-2);
-  background: var(--inset);
+@media (hover: hover) {
+  .attach:hover:not(:disabled) {
+    color: var(--fg-2);
+    background: var(--inset);
+  }
 }
 .attach svg {
   width: 17px;
@@ -1443,8 +1621,10 @@ button.step:hover {
   height: 17px;
 }
 
-.send:hover:not(:disabled) {
-  transform: translateX(2px);
+@media (hover: hover) {
+  .send:hover:not(:disabled) {
+    transform: translateX(2px);
+  }
 }
 
 .send:active:not(:disabled) {
@@ -1563,13 +1743,79 @@ button.step:hover {
   }
 
   /*
-   * The text gets the composer's full width; the sender mark, attach buttons, refusal and send button share a tool
-   * row below it. Long text stops growing at a seventh of the visible height, so the messages keep about half the screen.
+   * The conversation's header folds into the top bar (05 §6.2): its heading is only read out, its switches sit in the
+   * bar. A sub-conversation keeps its line of facts and its action; only the name moves up.
    */
+  .foldHead {
+    position: absolute;
+    display: block;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    border: 0;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .barToggle {
+    position: relative;
+    display: grid;
+    width: 40px;
+    height: 40px;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--fg-2);
+    transition:
+      background var(--dur-1),
+      color var(--dur-1);
+  }
+
+  .barToggle svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .barToggle[aria-pressed='true'] {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .barToggle:active {
+    background: var(--hover);
+    transition-duration: 0s;
+  }
+
+  /*
+   * One row, as in a messaging app: add, the field, send. Attachments, command suggestions and hints stack above it.
+   * Long text grows the field upwards and stops at a seventh of the visible height.
+   */
+  .dock {
+    gap: var(--s-2);
+    padding: var(--s-2) var(--s-3);
+  }
+
+  /* The timeline bounces at its own ends and never drags the page with it. */
+  .conv {
+    overscroll-behavior: contain;
+  }
+
   .composer {
     display: grid;
-    grid-template-columns: auto auto auto minmax(0, 1fr) auto;
-    gap: var(--s-1);
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: end;
+    gap: var(--s-2) 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .composer:focus-within {
+    box-shadow: none;
   }
 
   .composer > * {
@@ -1580,32 +1826,89 @@ button.step:hover {
     display: contents;
   }
 
-  .input {
-    grid-column: 1 / -1;
-    order: 1;
-    max-height: min(180px, calc(var(--viewport-height, 100dvh) / 7));
-    padding: var(--s-1) var(--s-2);
-  }
-
-  .sender,
-  .attach {
-    order: 2;
-  }
-
   .blocked {
     display: none;
   }
 
   .blockedShort {
     display: flex;
-    grid-column: 4;
+    grid-column: 1 / -1;
+    order: 1;
+    padding: 0 var(--s-2);
+  }
+
+  /* A disc like the send button's, so the two ends of the row match; centred on the one-line field. */
+  .attach {
+    grid-column: 1;
+    order: 2;
+    margin: 0 var(--s-2) calc(var(--s-1) / 2) 0;
+    border: 1px solid var(--line-2);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--fg-2);
+  }
+
+  .attach svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .input,
+  .send {
     order: 3;
-    padding: 0 var(--s-1);
+  }
+
+  /* The field is a capsule of its own; the row around it has no frame. */
+  .input {
+    grid-column: 2;
+    min-height: 40px;
+    max-height: min(180px, calc(var(--viewport-height, 100dvh) / 7));
+    padding: var(--s-2) var(--s-4);
+    border: 1px solid var(--line-2);
+    border-radius: 20px;
+    background: var(--surface);
+    line-height: 22px;
+    transition:
+      border-color var(--dur-1),
+      box-shadow var(--dur-1);
+  }
+
+  .input:focus {
+    border-color: var(--accent-line);
+    box-shadow: 0 0 0 3px var(--accent-soft);
   }
 
   .send {
-    grid-column: 5;
-    order: 4;
+    grid-column: 3;
+    /* Centred on the one-line field, which is 4px taller. */
+    margin: 0 0 calc(var(--s-1) / 2) var(--s-2);
+    border-radius: 999px;
+  }
+
+  /* The paper plane's weight sits up and to the right of its box. */
+  .send svg {
+    width: 18px;
+    height: 18px;
+    transform: translate(-1px, 1px);
+  }
+
+  /* Nothing to send: the button steps back to a quiet disc instead of a faded accent. */
+  .send:disabled {
+    border: 1px solid var(--line-2);
+    background: var(--surface);
+    box-shadow: none;
+    color: var(--faint);
+    opacity: 1;
+  }
+
+  .attach:active:not(:disabled) {
+    background: var(--hover);
+  }
+
+  .commandSuggestions {
+    border: 1px solid var(--line);
+    border-radius: var(--r-2);
+    background: var(--surface);
   }
 }
 

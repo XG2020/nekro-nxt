@@ -1,5 +1,12 @@
 declare const styles: {
   readonly app: string
+  readonly barActions: string
+  readonly barBack: string
+  readonly barMenu: string
+  readonly barName: string
+  readonly barStatus: string
+  readonly barText: string
+  readonly barTitle: string
   readonly bell: string
   readonly bellCount: string
   readonly bellHead: string
@@ -12,17 +19,25 @@ declare const styles: {
   readonly crumb: string
   readonly crumbPart: string
   readonly crumbSep: string
+  readonly hintActions: string
+  readonly homeSteps: string
   readonly hostBanner: string
+  readonly inlineIcon: string
   readonly instance: string
   readonly instanceState: string
   readonly main: string
+  readonly menuBrand: string
+  readonly menuDivider: string
+  readonly menuHead: string
+  readonly menuHeading: string
+  readonly menuItem: string
+  readonly menuList: string
   readonly rail: string
   readonly railDesktopOnly: string
   readonly railDivider: string
   readonly railExtension: string
   readonly railIndicator: string
   readonly railItem: string
-  readonly railMobileOnly: string
   readonly railSpacer: string
   readonly railSvgIcon: string
   readonly runDot: string

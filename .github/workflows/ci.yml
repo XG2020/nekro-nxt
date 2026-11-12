@@ -46,15 +46,27 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # The login page tests drive a real browser (passkeys, camera scanning).
+      # security.ubuntu.com is not always reachable from GitHub's runners; their Azure mirror carries the same
+      # security pocket, and apt still checks every package against Ubuntu's signing keys.
+      - name: Use the Azure mirror for Ubuntu security updates
+        run: grep -rlE 'security\.ubuntu\.com' /etc/apt | xargs -r sudo sed -i -E 's#https?://security\.ubuntu\.com#http://azure.archive.ubuntu.com#g'
       - run: pnpm exec playwright install --with-deps chromium-headless-shell
       - run: pnpm test:coverage
 
+  # One job per group (playwright.browser.config.ts): the largest files alone, the rest together.
   browser:
+    name: browser (${{ matrix.group }})
     concurrency:
-      group: browser-${{ github.ref }}
+      group: browser-${{ matrix.group }}-${{ github.ref }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [app, settings, shell, rest]
+    env:
+      NEKRO_BROWSER_TEST_GROUP: ${{ matrix.group }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -65,17 +77,29 @@ jobs:
           node-version: 22.23.2
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # security.ubuntu.com is not always reachable from GitHub's runners; their Azure mirror carries the same
+      # security pocket, and apt still checks every package against Ubuntu's signing keys.
+      - name: Use the Azure mirror for Ubuntu security updates
+        run: grep -rlE 'security\.ubuntu\.com' /etc/apt | xargs -r sudo sed -i -E 's#https?://security\.ubuntu\.com#http://azure.archive.ubuntu.com#g'
       - run: pnpm exec playwright install --with-deps chromium chromium-headless-shell
       # The pages resolve workspace packages to source, but the Playwright specs import their built entries.
       - run: pnpm build
       - run: pnpm test:browser
 
+  # Two jobs (playwright.config.ts): the two longest files, and every other file.
   journey:
+    name: journey (${{ matrix.group }})
     concurrency:
-      group: journey-${{ github.ref }}
+      group: journey-${{ matrix.group }}-${{ github.ref }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [longest, rest]
+    env:
+      NEKRO_JOURNEY_GROUP: ${{ matrix.group }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -86,6 +110,10 @@ jobs:
           node-version: 22.23.2
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # security.ubuntu.com is not always reachable from GitHub's runners; their Azure mirror carries the same
+      # security pocket, and apt still checks every package against Ubuntu's signing keys.
+      - name: Use the Azure mirror for Ubuntu security updates
+        run: grep -rlE 'security\.ubuntu\.com' /etc/apt | xargs -r sudo sed -i -E 's#https?://security\.ubuntu\.com#http://azure.archive.ubuntu.com#g'
       - run: pnpm exec playwright install --with-deps chromium chromium-headless-shell
       - run: pnpm build
       - run: pnpm test:journey:built
@@ -93,7 +121,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-results-${{ github.run_attempt }}
+          name: playwright-results-${{ matrix.group }}-${{ github.run_attempt }}
           path: .local/playwright-results
           if-no-files-found: warn
           retention-days: 7
@@ -119,6 +147,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm smoke:better-sqlite3
       # The login page tests drive a real browser (passkeys, camera scanning).
+      # security.ubuntu.com is not always reachable from GitHub's runners; their Azure mirror carries the same
+      # security pocket, and apt still checks every package against Ubuntu's signing keys.
+      - name: Use the Azure mirror for Ubuntu security updates
+        run: grep -rlE 'security\.ubuntu\.com' /etc/apt | xargs -r sudo sed -i -E 's#https?://security\.ubuntu\.com#http://azure.archive.ubuntu.com#g'
       - run: pnpm exec playwright install --with-deps chromium-headless-shell
       - run: pnpm test
 
@@ -248,6 +280,56 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # The Android development app (ai.nekro.nxt.dev) for the same Preview; its version counts up with each CI run so
+  # the in-app update sees every new Preview.
+  preview-android:
+    needs: preview-prepare
+    if: needs.preview-prepare.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Development signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_DEV_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || { echo "缺少开发签名密钥 ANDROID_DEV_KEYSTORE_BASE64。"; exit 1; }
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/dev.keystore"
+          echo "NXT_ANDROID_DEV_KEYSTORE=$RUNNER_TEMP/dev.keystore" >> "$GITHUB_ENV"
+          base=$(sed -n 's/.*versionName = ciVersionName ?: "\(.*\)"/\1/p' apps/android/app/build.gradle.kts)
+          echo "NXT_ANDROID_VERSION_NAME=$base-preview.${{ github.run_number }}" >> "$GITHUB_ENV"
+          echo "NXT_ANDROID_VERSION_CODE=${{ github.run_number }}" >> "$GITHUB_ENV"
+      - name: Build Android Preview
+        working-directory: apps/android
+        env:
+          NXT_ANDROID_DEV_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_DEV_KEYSTORE_PASSWORD }}
+          NXT_ANDROID_DEV_KEY_ALIAS: ${{ secrets.ANDROID_DEV_KEY_ALIAS }}
+          NXT_ANDROID_DEV_KEY_PASSWORD: ${{ secrets.ANDROID_DEV_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleDebug
+      - name: Name the APK and write its receipt
+        run: |
+          mkdir -p .local/preview-android
+          node scripts/android-release.mjs candidate preview --apk apps/android/app/build/outputs/apk/debug/app-debug.apk --out-dir .local/preview-android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-candidates-android-${{ github.sha }}-${{ github.run_attempt }}
+          compression-level: 0
+          path: .local/preview-android/*
+          if-no-files-found: error
+          retention-days: 1
+
   # Each architecture is built and smoke-tested on its own native runner; preview-server merges them.
   preview-server-build:
     name: preview-server-build (linux-${{ matrix.arch }})
@@ -304,8 +386,16 @@ jobs:
             sleep 1
           done
           docker exec "$container" node /opt/nekro/server/managed-plugin-smoke.mjs verify-remove http://127.0.0.1:4960 /data/managed-plugin-smoke.json
+      # Both architectures push at once and share base layers; the registry now and then answers "unknown blob" to
+      # one of them. A push is idempotent, so try again.
       - name: Push Server Preview candidate
-        run: docker push "$NEKRO_IMAGE"
+        run: |
+          for attempt in 1 2 3; do
+            docker push "$NEKRO_IMAGE" && exit 0
+            echo "push failed (attempt $attempt), retrying"
+            sleep $((attempt * 10))
+          done
+          exit 1
 
   preview-server:
     name: preview-server (linux-amd64, linux-arm64)
@@ -339,8 +429,8 @@ jobs:
           retention-days: 1
 
   preview-finalize:
-    if: always() && needs.all-checks-passed.result == 'success' && needs.preview-prepare.outputs.build == 'true' && needs.preview-desktop.result == 'success' && needs.preview-server.result == 'success'
-    needs: [all-checks-passed, preview-prepare, preview-desktop, preview-server]
+    if: always() && needs.all-checks-passed.result == 'success' && needs.preview-prepare.outputs.build == 'true' && needs.preview-desktop.result == 'success' && needs.preview-android.result == 'success' && needs.preview-server.result == 'success'
+    needs: [all-checks-passed, preview-prepare, preview-desktop, preview-android, preview-server]
     concurrency:
       group: preview-publish
       cancel-in-progress: false
@@ -381,3 +471,13 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: node scripts/mirror-desktop-release.mjs preview --artifacts-dir .local/preview-candidates
+      # The development APK and the manifest the app's in-app update reads (nxt/android/preview/manifest.json).
+      - name: Mirror the Android APK to dl.nekro.ai
+        if: ${{ vars.R2_ACCOUNT_ID != '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: node scripts/android-release.mjs mirror preview --artifacts-dir .local/preview-candidates

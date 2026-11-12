@@ -9,6 +9,7 @@ declare const styles: {
   readonly attachmentInfo: string
   readonly attachmentPreview: string
   readonly attachments: string
+  readonly barToggle: string
   readonly blocked: string
   readonly blockedShort: string
   readonly bubble: string
@@ -17,6 +18,7 @@ declare const styles: {
   readonly cardIndex: string
   readonly cardState: string
   readonly chan: string
+  readonly channelTree: string
   readonly chevron: string
   readonly commandContent: string
   readonly commandDelivery: string
@@ -44,6 +46,7 @@ declare const styles: {
   readonly fallbackChip: string
   readonly filter: string
   readonly filterRow: string
+  readonly foldHead: string
   readonly fresh: string
   readonly group: string
   readonly groupBadge: string
@@ -54,6 +57,7 @@ declare const styles: {
   readonly groupName: string
   readonly groupToggle: string
   readonly head: string
+  readonly hiddenActions: string
   readonly hiddenFromAgent: string
   readonly hookNote: string
   readonly hostNoteText: string
@@ -126,6 +130,13 @@ declare const styles: {
   readonly scheduledNoticeTitle: string
   readonly send: string
   readonly sender: string
+  readonly sortDone: string
+  readonly sortHandle: string
+  readonly sortLifted: string
+  readonly sortList: string
+  readonly sortMode: string
+  readonly sortRow: string
+  readonly sortRowBody: string
   readonly sourceName: string
   readonly stack: string
   readonly step: string

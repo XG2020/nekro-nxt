@@ -1,4 +1,14 @@
 declare const styles: {
+  readonly actionSheet: string
+  readonly actionSheetGrabber: string
+  readonly actionSheetHead: string
+  readonly actionSheetItem: string
+  readonly actionSheetLabel: string
+  readonly actionSheetLift: string
+  readonly actionSheetList: string
+  readonly actionSheetMore: string
+  readonly actionSheetPage: string
+  readonly actionSheetTitle: string
   readonly actions: string
   readonly bad: string
   readonly body: string
@@ -17,6 +27,8 @@ declare const styles: {
   readonly sheetBody: string
   readonly sheetFoot: string
   readonly sheetHead: string
+  readonly sidePanel: string
+  readonly sidePanelScrim: string
   readonly srOnly: string
   readonly title: string
   readonly titleRow: string

@@ -1,7 +1,9 @@
 import { useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { HostApiContracts } from '@nekro-nxt/contracts'
+import { inClientShell } from './android-shell.js'
 import { callHostApi } from './host-api-client.js'
+import { appleTouchDevice, standalone } from './home-screen.js'
 import { registerServiceWorker } from './service-worker.js'
 
 /**
@@ -19,15 +21,6 @@ export type PushState =
   | 'on'
 
 const OPEN_ROUTE_MESSAGE = 'nekro-nxt:open-route'
-
-const standalone = (): boolean =>
-  window.matchMedia('(display-mode: standalone)').matches ||
-  (navigator as Navigator & { readonly standalone?: boolean }).standalone === true
-
-const appleTouchDevice = (): boolean =>
-  /iPad|iPhone|iPod/u.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
-
-const inDesktopShell = (): boolean => window.nekroDesktopShell !== undefined
 
 /** The id the server lists a subscription under; the endpoint itself never leaves this browser and the server. */
 export const pushSubscriptionId = async (endpoint: string): Promise<string> => {
@@ -137,7 +130,7 @@ export const disablePush = async (): Promise<void> => {
 export const usePushNotificationRoutes = (): void => {
   const navigate = useNavigate()
   useEffect(() => {
-    if (inDesktopShell() || !('serviceWorker' in navigator)) return
+    if (inClientShell() || !('serviceWorker' in navigator)) return
     void registerServiceWorker()
     const open = (event: MessageEvent<unknown>) => {
       const data: unknown = event.data

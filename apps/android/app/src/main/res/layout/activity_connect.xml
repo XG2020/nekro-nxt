@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="24dp"
+        android:paddingTop="56dp"
+        android:paddingEnd="24dp"
+        android:paddingBottom="24dp">
+
+        <ImageView
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:contentDescription="@null"
+            android:src="@mipmap/ic_launcher" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="连接实例"
+            android:textColor="@color/nxt_text"
+            android:textSize="28sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/intro"
+            style="@style/Nxt.Note"
+            android:text="在已登录的电脑或浏览器上打开「设置 → 登录与访问」，点「连接安卓应用」，再用手机扫码。" />
+
+        <LinearLayout
+            android:id="@+id/addressSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView style="@style/Nxt.Label" android:text="地址" />
+
+            <EditText
+                android:id="@+id/address"
+                style="@style/Nxt.Field"
+                android:autofillHints="url"
+                android:hint="例如 nxt.example.com"
+                android:imeOptions="actionGo"
+                android:inputType="textUri" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/keySection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/found"
+                style="@style/Nxt.Note"
+                android:layout_marginTop="12dp" />
+
+            <CheckBox
+                android:id="@+id/acceptInsecure"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="我了解连接未加密的风险"
+                android:textColor="@color/nxt_text"
+                android:visibility="gone" />
+
+            <LinearLayout
+                android:id="@+id/secretSection"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <TextView style="@style/Nxt.Label" android:text="配对码或管理密钥" />
+
+                <EditText
+                    android:id="@+id/secret"
+                    style="@style/Nxt.Field"
+                    android:autofillHints="password"
+                    android:hint="例如 ABCD-EFGH"
+                    android:imeOptions="actionDone"
+                    android:inputType="textPassword" />
+
+                <TextView
+                    style="@style/Nxt.Note"
+                    android:text="配对码在已登录设备的「连接安卓应用」里，5 分钟内有效。管理密钥只用这一次，不会保存在手机上。" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/error"
+            style="@style/Nxt.Note"
+            android:layout_marginTop="16dp"
+            android:textColor="@color/nxt_danger"
+            android:visibility="gone" />
+
+        <Button
+            android:id="@+id/primary"
+            style="@style/Nxt.PrimaryButton"
+            android:text="扫码连接" />
+
+        <Button
+            android:id="@+id/secondary"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="8dp"
+            android:background="@android:color/transparent"
+            android:text="输入地址"
+            android:textColor="@color/nxt_accent"
+            android:textSize="15sp" />
+
+        <ProgressBar
+            android:id="@+id/progress"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="16dp"
+            android:indeterminateTint="@color/nxt_accent"
+            android:visibility="gone" />
+
+        <LinearLayout
+            android:id="@+id/savedSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView style="@style/Nxt.Label" android:layout_marginTop="32dp" android:text="已连接的实例" />
+
+            <LinearLayout
+                android:id="@+id/savedList"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical" />
+        </LinearLayout>
+    </LinearLayout>
+</ScrollView>

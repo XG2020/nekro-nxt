@@ -1,4 +1,4 @@
-import { ArrowRight, FilePlus2, ImagePlus, Plug, RotateCcw, X } from 'lucide-react'
+import { ArrowRight, FilePlus2, Paperclip, Plug, Plus, RotateCcw, Send, X } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type RefObject } from 'react'
 import { commandApi, type CommandCatalog } from '../../command-api.js'
 import { EMPTY_CHANNEL_DRAFT, isReadyAttachment, type ChannelAttachment } from '../../channel-drafts.js'
@@ -10,7 +10,7 @@ import {
   type ChannelSummary,
   type ConnectionSummary,
 } from '../../product-runtime.js'
-import { FileChooser, InfoTip, Pressable, Textarea, Tooltip, toast } from '../../ui-kit/index.js'
+import { FileChooser, InfoTip, Pressable, Textarea, Tooltip, toast, usePhone } from '../../ui-kit/index.js'
 import { connectionStatus } from '../model/connection-status.js'
 import { useProductApi } from '../model/store.js'
 import { randomId } from '../../random-id.js'
@@ -137,10 +137,10 @@ export function Composer({
   const incomplete = attachments.some((item) => !isReadyAttachment(item))
   const composing = useRef(false)
   const input = useRef<HTMLTextAreaElement>(null)
-  const imagePicker = useRef<HTMLInputElement>(null)
   const filePicker = useRef<HTMLInputElement>(null)
   const form = useRef<HTMLFormElement>(null)
   const [dragging, setDragging] = useState(false)
+  const phone = usePhone()
   const dragDepth = useRef(0)
   const external = channel.kind !== 'internal'
   const commandRequest = useRef<{ channelId: string; revision: number; id: string } | undefined>(undefined)
@@ -194,7 +194,7 @@ export function Composer({
     if (command) ui.getState().setChannelDraft(channel.id, '/' + command.fullName + ' ')
     input.current?.focus()
   }
-  // `short` leaves out the account, which phones show as the sender mark next to it.
+  // `short` leaves out the account: a phone has one row for the field and no room for the full sentence.
   const refusal: { readonly full: string; readonly short: string } | undefined = commandMode
     ? undefined
     : !agent
@@ -380,7 +380,8 @@ export function Composer({
       <div className={styles.composerRow}>
         {commandMode ? (
           <span className={styles.as}>执行当前频道命令</span>
-        ) : external && connection ? (
+        ) : external && connection && !phone ? (
+          // A phone leaves the mark out: a touch has no hover to read it by, and the top bar names the channel.
           // Only the mark stays in the row: the account name is often long and the placeholder already names
           // the channel; who sends it is a hover or a tap away.
           <Tooltip content={`以「${connectionDisplayName(connection)}」发出，群成员可见`}>
@@ -417,21 +418,19 @@ export function Composer({
           placeholder={
             dragging
               ? '松开以添加附件'
-              : external
-                ? `发到 ${channel.name}，或输入 / 执行命令`
-                : `给 ${agent?.name ?? '智能体'} 发消息，或输入 / 执行命令`
+              : phone
+                ? // The top bar already names the channel and who answers; the field says only what it is for.
+                  '发消息'
+                : external
+                  ? `发到 ${channel.name}，或输入 / 执行命令`
+                  : `给 ${agent?.name ?? '智能体'} 发消息，或输入 / 执行命令`
           }
+          // Enter sends (Shift+Enter starts a new line); the on-screen keyboard labels its key to match.
+          enterKeyHint="send"
           aria-label="消息"
           aria-autocomplete="list"
           aria-controls={completing ? `commands-${channel.id}` : undefined}
           aria-activedescendant={completing && suggestions.length ? `command-${channel.id}-${selected}` : undefined}
-        />
-        <FileChooser
-          ref={imagePicker}
-          accept="image/*"
-          label="选择图片"
-          disabled={Boolean(blocked) || sending}
-          onFiles={(files) => addFiles(files)}
         />
         <FileChooser
           ref={filePicker}
@@ -439,25 +438,17 @@ export function Composer({
           disabled={Boolean(blocked) || sending}
           onFiles={(files) => addFiles(files)}
         />
+        {/* Any kind of file goes through one button: pictures are told apart by their type once chosen, and a phone's
+            own chooser already offers its photo library, camera and files. */}
         <Pressable
           type="button"
           className={styles.attach}
           disabled={Boolean(blocked) || sending}
-          aria-label="添加图片"
-          title="添加图片（也可粘贴或拖入，合计不超过 64 MiB）"
-          onClick={() => imagePicker.current?.click()}
-        >
-          <ImagePlus aria-hidden="true" />
-        </Pressable>
-        <Pressable
-          type="button"
-          className={styles.attach}
-          disabled={Boolean(blocked) || sending}
-          aria-label="添加文件"
-          title="添加文件（也可粘贴或拖入，合计不超过 64 MiB）"
+          aria-label="添加附件"
+          title={phone ? undefined : '添加附件（也可粘贴或拖入，合计不超过 64 MiB）'}
           onClick={() => filePicker.current?.click()}
         >
-          <FilePlus2 aria-hidden="true" />
+          {phone ? <Plus aria-hidden="true" /> : <Paperclip aria-hidden="true" />}
         </Pressable>
         {refusal ? (
           <span className={styles.blockedShort}>
@@ -474,7 +465,7 @@ export function Composer({
           aria-label="发送"
           title={incomplete ? '请完成上传或移除未完成的附件' : '发送'}
         >
-          <ArrowRight aria-hidden="true" />
+          {phone ? <Send aria-hidden="true" /> : <ArrowRight aria-hidden="true" />}
         </Pressable>
       </div>
     </form>
