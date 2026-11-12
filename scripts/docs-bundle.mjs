@@ -1,6 +1,6 @@
 // Builds the user documentation in docs/site into the bundle the community site serves at /docs.
 //   node scripts/docs-bundle.mjs check                      validate pages, the generated index and docs links in code
-//   node scripts/docs-bundle.mjs readme                     regenerate docs/site/README.md
+//   node scripts/docs-bundle.mjs readme                     regenerate docs/site/README.md and the help button's routes
 //   node scripts/docs-bundle.mjs build <stable|preview> [--out .local/docs-bundle] [--shots .local/docs-shots] [--strict]
 //   node scripts/docs-bundle.mjs upload <stable|preview> [--out .local/docs-bundle]   needs R2_ACCOUNT_ID and keys
 // Bundle format: docs/site/BUNDLE.md.
@@ -16,6 +16,7 @@ import { readProductRelease } from './product-release.mjs'
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const siteRoot = 'docs/site'
 const readmePath = `${siteRoot}/README.md`
+const routesPath = 'apps/web/src/app/shell/docs-routes.ts'
 export const DOCS_ORIGIN = 'https://nxt.nekro.ai'
 const DIST_ORIGIN = 'https://dl.nekro.ai/nxt/docs'
 const ASSET_ORIGIN = `${DIST_ORIGIN}/assets`
@@ -192,6 +193,16 @@ export async function readSite({ commit = 'main' } = {}) {
     }
   }
 
+  // The help button opens one page per interface route, so a route belongs to exactly one page.
+  const routeOwners = new Map()
+  for (const page of pages.values())
+    for (const route of page.fields.routes) {
+      if (!/^\/[a-z0-9-]+(?:\/[a-z0-9-]+)*$/u.test(route))
+        errors.push(`${page.file}：routes 里的 ${route} 不是界面路由`)
+      else if (routeOwners.has(route)) errors.push(`${page.file}：路由 ${route} 已经属于 ${routeOwners.get(route)}`)
+      else routeOwners.set(route, page.id)
+    }
+
   const assets = new Map()
   const addAsset = (file) => {
     const extension = path.extname(file).toLowerCase()
@@ -300,6 +311,43 @@ async function checkCodeLinks(pages) {
   return errors
 }
 
+const SDK_SOURCE = 'packages/extension-sdk/src/index.ts'
+const SDK_PAGE = 'develop/sdk'
+
+/** Members declared directly in one `export interface Name {` block (or a nested `readonly name: {` block). */
+const interfaceMembers = (source, opening, indent) => {
+  const start = source.indexOf(opening)
+  if (start < 0) return null
+  const members = []
+  for (const line of source.slice(start + opening.length).split('\n')) {
+    if (line.startsWith(`${' '.repeat(indent - 2)}}`)) break
+    const member = line.match(new RegExp(`^ {${indent}}(?:readonly )?([a-zA-Z]+)\\??[:(<]`, 'u'))
+    if (member) members.push(member[1])
+  }
+  return members
+}
+
+/**
+ * The SDK reference is written by hand, so this keeps it from falling behind: every host capability and harness method
+ * the SDK declares has to appear in the page as code.
+ */
+async function checkSdkReference(pages) {
+  const page = pages.get(SDK_PAGE)
+  if (page === undefined) return []
+  const source = await readFile(path.join(repositoryRoot, SDK_SOURCE), 'utf8')
+  const surface = [
+    interfaceMembers(source, 'export interface NxtHostService {', 2),
+    interfaceMembers(source, 'export interface NxtHostLayerService {', 2),
+    interfaceMembers(source, '  readonly harness: {', 4),
+  ]
+  if (surface.some((members) => members === null || members.length === 0))
+    return [`${SDK_SOURCE}：找不到 NxtHostService、NxtHostLayerService 或 harness，更新 checkSdkReference`]
+  const missing = [...new Set(surface.flat())].filter((name) => !page.markdown.includes(`\`${name}\``))
+  return missing.length === 0
+    ? []
+    : [`${page.file}：SDK 新增的 ${missing.map((name) => `\`${name}\``).join('、')} 还没有写进参考`]
+}
+
 export function renderReadme(sections, pages) {
   const lines = [
     '# NekroNXT 使用文档',
@@ -375,6 +423,22 @@ export function applyFlows(site, reportsDir, previous) {
     }
   }
   return { shots, stale, missing }
+}
+
+/** The help button's table: the deepest matching route wins, so longer routes come first. */
+export function renderRoutes(pages) {
+  const routes = [...pages.values()]
+    .flatMap((page) => page.fields.routes.map((route) => [route, page.id]))
+    .sort(([a], [b]) => b.split('/').length - a.split('/').length || a.localeCompare(b))
+  return [
+    '// 由 node scripts/docs-bundle.mjs readme 按使用文档页面头部的 routes 生成，不要手改。',
+    '',
+    '/** Interface routes and the documentation page the help button opens there; deeper routes first. */',
+    'export const DOCS_ROUTES: readonly (readonly [route: string, page: string])[] = [',
+    ...routes.map(([route, id]) => `  ['${route}', '${id}'],`),
+    ']',
+    '',
+  ].join('\n')
 }
 
 export function bundleOf({ sections, pages }, release, builtAt, { shots = {}, stale = new Map() } = {}) {
@@ -493,9 +557,13 @@ async function main() {
     const errors = [...site.errors]
     if (errors.length === 0) {
       errors.push(...(await checkCodeLinks(site.pages)))
+      errors.push(...(await checkSdkReference(site.pages)))
       const current = await readFile(path.join(repositoryRoot, readmePath), 'utf8').catch(() => '')
       if (current !== renderReadme(site.sections, site.pages))
         errors.push(`${readmePath} 已过期，运行 node scripts/docs-bundle.mjs readme`)
+      const routes = await readFile(path.join(repositoryRoot, routesPath), 'utf8').catch(() => '')
+      if (routes !== renderRoutes(site.pages))
+        errors.push(`${routesPath} 已过期，运行 node scripts/docs-bundle.mjs readme`)
     }
     if (errors.length > 0) {
       console.error(['使用文档检查失败：', ...errors.map((error) => `  - ${error}`)].join('\n'))
@@ -506,6 +574,7 @@ async function main() {
     const site = await readSite()
     if (site.errors.length > 0) throw new Error(site.errors.join('\n'))
     await writeFile(path.join(repositoryRoot, readmePath), renderReadme(site.sections, site.pages))
+    await writeFile(path.join(repositoryRoot, routesPath), renderRoutes(site.pages))
   } else if ((command === 'build' || command === 'upload') && (channel === 'stable' || channel === 'preview')) {
     if (command === 'upload') await upload(channel, out)
     else

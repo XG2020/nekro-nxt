@@ -154,6 +154,7 @@ import { ChannelExtensionRuntimeHost, createChannelAsset, DshHostRuntime, type D
 import { NotificationService, type WebPushSender } from './notifications.js'
 import { AccessSettings } from './access-settings.js'
 import { CommunityService } from './community.js'
+import { communityDocs, type CommunityDocsPort } from './community-docs-tools.js'
 import { ExtensionActionService } from './extension-governance/actions.js'
 import { commandPrefix, ExtensionCommandPort, waitingRunCommands } from './extension-governance/commands.js'
 import { ExtensionGovernanceTools } from './extension-governance/tool-port.js'
@@ -1289,6 +1290,7 @@ export class NekroRuntime {
       await linkedAccounts.prepare()
       const notificationsPort: { current?: NotificationService } = {}
       const feedbackPort: { current?: CommunityFeedbackService } = {}
+      const docsPort: { current?: CommunityDocsPort } = {}
       const governancePort: { current?: ExtensionGovernanceTools } = {}
       const restartPort: { current?: NekroRuntime } = {}
       const subConversationChanges = new Set<() => void>()
@@ -1316,6 +1318,7 @@ export class NekroRuntime {
           },
         },
         speech: speechService,
+        communityDocs: () => docsPort.current,
         ...(options.feedbackEnvironment === undefined ? {} : { releaseId: options.feedbackEnvironment.releaseId }),
         hostRestart: (): HostRestartRequester | undefined => {
           const current = restartPort.current
@@ -1690,6 +1693,7 @@ export class NekroRuntime {
         ...(options.community?.fetch === undefined ? {} : { fetch: options.community.fetch }),
         now,
       })
+      docsPort.current = communityDocs(community, options.feedbackEnvironment?.releaseId ?? 'development')
       const unsubscribeDynamicApproval = host.subscribeDynamicApprovalRequests((event) => {
         const displayName = repository.getAgent(event.agentId)?.revision.displayName ?? '未命名智能体'
         // A chat platform has no button to press: the channel gets the commands, as for an extension request (#141).
