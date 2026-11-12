@@ -528,20 +528,22 @@ export class MediaToolkit {
 
   async #probe(input: string, options: RunOptions): Promise<MediaProbe> {
     const { ffprobe } = this.#require()
-    const result = await this.#inspectProgram(
-      ffprobe,
-      [
-        '-hide_banner',
-        '-v',
-        'error',
-        '-print_format',
-        'json',
-        '-show_format',
-        '-show_streams',
-        ...MEDIA_INPUT_PREFIX,
-        `file:${input}`,
-      ],
-      { readable: [input], timeoutMs: options.timeoutMs ?? 30_000, signal: options.signal },
+    const result = await this.#inScratch((cwd) =>
+      this.#run(
+        ffprobe,
+        [
+          '-hide_banner',
+          '-v',
+          'error',
+          '-print_format',
+          'json',
+          '-show_format',
+          '-show_streams',
+          ...MEDIA_INPUT_PREFIX,
+          `file:${input}`,
+        ],
+        { cwd, readable: [input], timeoutMs: options.timeoutMs ?? 30_000, signal: options.signal },
+      ),
     )
     let parsed: z.output<typeof ProbeOutputSchema>
     try {
@@ -649,7 +651,9 @@ export class MediaToolkit {
     const { ffmpeg } = this.#require()
     let known = this.#encoders.get(ffmpeg)
     if (known === undefined) {
-      known = this.#inspectProgram(ffmpeg, ['-hide_banner', '-encoders'], { readable: [], timeoutMs: 30_000 }).then(
+      known = this.#inScratch((cwd) =>
+        this.#run(ffmpeg, ['-hide_banner', '-encoders'], { cwd, readable: [], timeoutMs: 30_000 }),
+      ).then(
         (result) =>
           new Set([...result.stdout.toString('utf8').matchAll(/^ [VAS][A-Z.]{5} (\S+)/gmu)].map((match) => match[1]!)),
       )
@@ -700,16 +704,11 @@ export class MediaToolkit {
     return this.#run(ffmpeg, ['-nostdin', '-hide_banner', '-nostats', '-y', ...args], options)
   }
 
-  /** Read-only program calls still need their own writable scratch directory, separate from the sandbox's temp root. */
-  async #inspectProgram(
-    executable: string,
-    args: readonly string[],
-    options: { readable: readonly string[]; timeoutMs: number; signal?: AbortSignal | undefined },
-  ) {
-    options.signal?.throwIfAborted()
-    const cwd = await mkdtemp(path.join(tmpdir(), 'nekro-nxt-media-inspect-'))
+  /** Runs that write nothing still need a workspace; the Windows sandbox refuses the temp root itself as one. */
+  async #inScratch<T>(run: (cwd: string) => Promise<T>): Promise<T> {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'nekro-nxt-media-'))
     try {
-      return await this.#run(executable, args, { ...options, cwd })
+      return await run(cwd)
     } finally {
       await rm(cwd, { recursive: true, force: true })
     }
